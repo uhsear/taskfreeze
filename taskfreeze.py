@@ -23,7 +23,8 @@ already off before the freeze. A manifest that has been thawed cannot be thawed 
 
 Reads the scheduler with `schtasks /query /xml` and changes it with
 `schtasks /change /tn NAME /disable` or `/enable`. Nothing is changed without --apply.
-The one file it writes is the manifest. Local machine only. Disabling a task does not
+The one file it writes is the manifest, through MANIFEST.tmp
+when it replaces the manifest. Local machine only. Disabling a task does not
 stop an instance that is already running.
 
 Exit codes: 0 done, 1 not everything was done or verified (a task failed to change,
@@ -41,6 +42,7 @@ import io
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -703,9 +705,9 @@ def _run(argv, scheduler):
 
 def fixture_xml(specs, declaration=True):
     """A listing in the shape `schtasks /query /xml` prints, for the self-test. Each spec
-    is a dict: name, enabled (default True), actions (list of (command, arguments)).
-    Every task carries a trigger with its own Enabled element, as real tasks do. With
-    declaration False the listing has the shape of `/xml ONE`."""
+    is a dict: name, enabled (default True), trigger_on (default True), actions (list of
+    (command, arguments)). Every task carries a trigger with its own Enabled element, as
+    real tasks do. With declaration False the listing has the shape of `/xml ONE`."""
     out = ["\r\n<Tasks>\r\n"]
     for spec in specs:
         out.append("\r\n<!-- %s -->\r\n" % spec["name"])
@@ -717,8 +719,9 @@ def fixture_xml(specs, declaration=True):
             out.append("    <Enabled>false</Enabled>\r\n")
         out.append("    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
                    "  </Settings>\r\n  <Triggers>\r\n    <TimeTrigger>\r\n"
-                   "      <Enabled>true</Enabled>\r\n    </TimeTrigger>\r\n"
-                   "  </Triggers>\r\n  <Actions Context=\"Author\">\r\n")
+                   "      <Enabled>%s</Enabled>\r\n    </TimeTrigger>\r\n"
+                   "  </Triggers>\r\n  <Actions Context=\"Author\">\r\n"
+                   % ("true" if spec.get("trigger_on", True) else "false"))
         for command, arguments in spec.get("actions", [("cmd", "/c exit")]):
             out.append("    <Exec>\r\n      <Command>%s</Command>\r\n" % escape(command))
             if arguments:
@@ -819,8 +822,8 @@ def _self_test(tmp):
     print("taskfreeze self-test: temporary files and a stand-in schtasks, no network")
     print("-" * 68)
 
-    def spec(name, enabled=True, actions=None):
-        out = {"name": name, "enabled": enabled}
+    def spec(name, enabled=True, actions=None, trigger_on=True):
+        out = {"name": name, "enabled": enabled, "trigger_on": trigger_on}
         if actions is not None:
             out["actions"] = actions
         return out
@@ -849,6 +852,9 @@ def _self_test(tmp):
     check(parse_tasks(fixture_xml([spec("\\T", False)]))[0].enabled is False,
           "a disabled task whose triggers all say Enabled true is still disabled  "
           "<-- pinned defect")
+    check(parse_tasks(fixture_xml([spec("\\T", True, None, False)]))[0].enabled is True,
+          "an ENABLED task whose trigger says Enabled false is still enabled, so a freeze "
+          "does not skip it as already off  <-- pinned defect")
     body = ('<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/'
             'task"><Settings><Enabled>%s</Enabled></Settings></Task>')
     for text, want in (("true", True), ("false", False), ("1", True), ("0", False),
@@ -910,6 +916,8 @@ def _self_test(tmp):
           ["\\Nightly\\Load", "\\Nightly\\Reconcile"], "--name selects by task path")
     check(names(select_tasks(tasks, None, act_re, None)) == ["\\Nightly\\Load"],
           "--action selects by command text")
+    check(select_tasks(tasks, None, compile_pattern("--action", "nightly"), None) == [],
+          "--action reads the command text, never the task path  <-- pinned defect")
     check(names(select_tasks(tasks, name_re, act_re, None)) == ["\\Nightly\\Load"],
           "--name and --action must both match")
     check(names(select_tasks(tasks, name_re, None, exc_re)) == ["\\Nightly\\Load"],
@@ -1034,21 +1042,67 @@ def _self_test(tmp):
     check(not drift and "on now; not this tool's doing" in lines[1],
           "a pre-off task found on is noted but is not this tool's drift")
 
+    two = mutated(disabled=["\\a", "\\b"], count=2, already_off=[])
+    lines, drift = status_report(two, [Task("\\a", True, ""), Task("\\b", False, "")])
+    check(drift and lines[0].startswith("ON") and lines[1].startswith("OFF"),
+          "drift in the FIRST frozen task is not hidden by a clean last one  "
+          "<-- pinned defect")
+    lines, drift = status_report(two, [Task("\\a", False, ""), Task("\\b", False, "")])
+    check(not drift, "a live freeze with every task still off is not drift")
+
     # --- decode_output and stamp -----------------------------------------------
     check(decode_output("caf\u00e9".encode("utf-16"), "ascii") == "caf\u00e9",
           "a UTF-16 BOM is honoured before the codec")
-    check(decode_output("caf\u00e9".encode("utf-16-be"), "ascii") != "x" and
-          decode_output(b"\xfe\xff\x00a", "ascii") == "a", "a big-endian UTF-16 BOM is honoured")
+    check(decode_output(b"\xfe\xff\x00a", "ascii") == "a",
+          "a big-endian UTF-16 BOM is honoured")
     check(decode_output(b"\xef\xbb\xbfabc", "ascii") == "abc", "a UTF-8 BOM is dropped")
     check(decode_output(b"caf\x82", "cp437") == "caf\u00e9", "the OEM code page decodes its bytes")
     check(decode_output(b"caf\xc3\xa9", "no-such-codec") == "caf\u00e9",
           "an unknown codec falls back to UTF-8")
     check(decode_output(b"caf\xff", "ascii") == "caf\ufffd",
           "an undecodable byte becomes U+FFFD, which is_lossy then catches")
-    check(decode_output(b"\xff\xfe\x00", "ascii") == "\ufffd" * 0 + decode_output(
-        b"\xff\xfe\x00", "ascii"), "a broken UTF-16 stream falls back instead of raising")
+    check(decode_output(b"\xff\xfe\x00", "ascii") == "\ufffd\ufffd\x00",
+          "a broken UTF-16 stream falls back to UTF-8 with replacement instead of raising")
     check(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", stamp()) is not None,
           "stamp is an ISO UTC timestamp")
+
+    real_datetime = globals()["datetime"]
+
+    class FakeClock(object):
+        @staticmethod
+        def now(tz=None):  # local time is five hours behind UTC in this fake
+            return real_datetime(2026, 1, 2, 3, 4, 5, tzinfo=tz) if tz is timezone.utc                 else real_datetime(2025, 12, 31, 22, 4, 5)
+
+    globals()["datetime"] = FakeClock
+    try:
+        got_stamp = stamp()
+    finally:
+        globals()["datetime"] = real_datetime
+    check(got_stamp == "2026-01-02T03:04:05Z",
+          "stamp reads the UTC clock, not local time  <-- pinned defect")
+
+    # --- the two writers -------------------------------------------------------
+    keep = os.path.join(tmp, "keep.json")
+    write_new(keep, {"v": 1})
+    raises(lambda: write_new(keep, {"v": 2}), "write_new onto an existing file raises  "
+           "<-- pinned defect", FileExistsError)
+    check(read_manifest(keep) == {"v": 1}, "a refused write_new leaves the first record whole")
+    real_replace = os.replace
+    swaps = []
+
+    def spy_replace(src, dst):
+        swaps.append((src, dst, os.path.exists(src)))
+        return real_replace(src, dst)
+
+    os.replace = spy_replace
+    try:
+        write_replace(keep, {"v": 3})
+    finally:
+        os.replace = real_replace
+    check(swaps == [(keep + ".tmp", keep, True)] and read_manifest(keep) == {"v": 3}
+          and not os.path.exists(keep + ".tmp"),
+          "write_replace writes a sibling file and swaps it in, so the record is never "
+          "half written  <-- pinned defect")
 
     # --- the stand-in schtasks, through subprocess -----------------------------
     stub = os.path.join(tmp, "stub_schtasks.py")
@@ -1409,7 +1463,8 @@ def _self_test(tmp):
         code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("abbr"), flag], sched())
         check(code == 64 and not os.path.exists(manifest_file("abbr")),
               "the prefix %s of --apply is REFUSED by the parser  <-- pinned defect" % flag)
-    for flag in ("--man", "--th", "--stat", "--from", "--sch", "--sel", "--exc"):
+    for flag in ("--na", "--act", "--exc", "--man", "--th", "--stat", "--from", "--sch",
+                 "--sel", "--he"):
         code, out, err = cli([flag, "x"], sched())
         check(code == 64, "the prefix %s is refused, not expanded" % flag)
     check(build_parser().allow_abbrev is False, "the parser has allow_abbrev False")
@@ -1417,6 +1472,23 @@ def _self_test(tmp):
     check(code == 64 and "unrecognized" in err, "an unknown flag exits 64")
     code, out, err = cli(["--help"], sched())
     check(code == 0 and "--apply" in out and "Exit:" in out, "--help prints the flags and exits 0")
+    saved_argv = sys.argv
+    sys.argv = ["taskfreeze.py", "--help"]
+    guard_code = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as as_script:
+            try:
+                runpy.run_path(os.path.abspath(__file__), run_name="__main__")
+            except SystemExit as exc:
+                guard_code = exc.code
+        with contextlib.redirect_stdout(io.StringIO()) as as_module:
+            namespace = runpy.run_path(os.path.abspath(__file__), run_name="imported")
+    finally:
+        sys.argv = saved_argv
+    check(guard_code == 0 and "--apply" in as_script.getvalue(),
+          "run as a script, the __main__ guard calls main() and exits with its code")
+    check("main" in namespace and as_module.getvalue() == "",
+          "loaded under another name, the module prints nothing and does not exit")
     # no environment variable and no config file can turn --apply on
     os.environ["TASKFREEZE_APPLY"] = "1"
     try:
@@ -1470,5 +1542,5 @@ def _self_test(tmp):
     return report()
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     sys.exit(main())

@@ -43,12 +43,17 @@ there.
 
 ## What a real run looks like
 
-This is a real session on Windows 11 (build 26100), against three scratch tasks the run created
-and deleted afterwards. Two were enabled (`a`, `b`). One (`pre-off`) was disabled before the freeze.
-The pattern is `^[\\]taskfreeze-dev[\\]`.
+This is a real session on Windows 11 (build 26100), run on 2026-10-24 against three scratch tasks
+that the run created and deleted afterwards. Two were enabled (`a`, `b`). One (`pre-off`) was
+disabled before the freeze. The pattern is `^[\\]taskfreeze-dev[\\]`.
+
+Nothing is cut. Standard output and standard error are merged, as a pipe delivers them. Standard
+error is unbuffered, so a `refused:` line can print before the standard output lines of the same
+run. The only edits are that `taskfreeze` stands for `python taskfreeze.py`, and that the last
+three lines come from `schtasks /query /fo csv /nh` after the thaw, filtered to the scratch folder.
 
 ```
-$ taskfreeze --name "^[\\]taskfreeze-dev[\\]" --manifest m.json
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json
 leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
 disable  \taskfreeze-dev\a
 disable  \taskfreeze-dev\b
@@ -56,24 +61,44 @@ disable  \taskfreeze-dev\b
 nothing changed. Add --apply to disable them.
 rc=0
 
-$ taskfreeze ... --manifest m.json --apply
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json --apply
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+disable  \taskfreeze-dev\a
+disable  \taskfreeze-dev\b
+2 to disable, 1 already off and left alone. Manifest: m.json
 disabled \taskfreeze-dev\a
 disabled \taskfreeze-dev\b
 froze 2 of 2 task(s). Manifest: m.json
 rc=0
 
-$ taskfreeze ... --manifest m2.json --apply        (the second freeze, a new path)
+$ taskfreeze --status m.json
+OFF      \taskfreeze-dev\a
+OFF      \taskfreeze-dev\b
+left     \taskfreeze-dev\pre-off  (off before the freeze, off now)
+ok: 2 task(s) in the manifest
+rc=0
+
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m2.json --apply
+refused: every matched task is already disabled, so the manifest would be empty and a thaw would restore nothing. A freeze may still be in force: check --status on its manifest.
+leave    \taskfreeze-dev\a  (already disabled, stays as it is)
+leave    \taskfreeze-dev\b  (already disabled, stays as it is)
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
 matched 0 enabled and 3 already disabled task(s); nothing was changed.
-refused: every matched task is already disabled, so the manifest would be empty and a thaw would
-restore nothing. A freeze may still be in force: check --status on its manifest.
 rc=3
 
-$ taskfreeze ... --manifest m.json --apply         (the second freeze, the same path)
-refused: the manifest file already exists. A second freeze must not overwrite the record of the
-first. Thaw it, or choose a new path.
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json --apply
+refused: the manifest file already exists. A second freeze must not overwrite the record of the first. Thaw it, or choose a new path.
+leave    \taskfreeze-dev\a  (already disabled, stays as it is)
+leave    \taskfreeze-dev\b  (already disabled, stays as it is)
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+matched 0 enabled and 3 already disabled task(s); nothing was changed.
 rc=3
 
-$ taskfreeze ... --manifest m3.json --ap           (a prefix of --apply)
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m3.json --ap
+usage: taskfreeze [-h] [--name NAME] [--action ACTION]
+                  [--except EXCEPT_PATTERN] [--manifest MANIFEST]
+                  [--thaw MANIFEST] [--status MANIFEST] [--from-xml FILE]
+                  [--schtasks PROGRAM] [--apply] [--self-test]
 taskfreeze: error: unrecognized arguments: --ap
 rc=64
 
@@ -81,18 +106,24 @@ $ taskfreeze --thaw m.json --apply
 enable   \taskfreeze-dev\a
 enable   \taskfreeze-dev\b
 left     \taskfreeze-dev\pre-off  (off before the freeze, stays off)
+enabled  \taskfreeze-dev\a
+enabled  \taskfreeze-dev\b
 2 of 2 task(s) in the manifest are enabled: 2 enabled now, 0 already on, 0 missing
 rc=0
 
-$ taskfreeze --thaw m.json --apply                 (again)
-refused: this manifest was already thawed at 2026-10-23T04:46:42Z. A second thaw could re-enable a
-task someone has disabled since.
+$ taskfreeze --thaw m.json --apply
+refused: this manifest was already thawed at 2026-10-24T21:45:37Z. A second thaw could re-enable a task someone has disabled since.
 rc=3
+
+"\taskfreeze-dev\a","1/1/2031 11:59:00 PM","Ready"
+"\taskfreeze-dev\b","1/1/2031 11:59:00 PM","Ready"
+"\taskfreeze-dev\pre-off","N/A","Disabled"
 ```
 
-After the thaw, `a` and `b` read `Ready` and `pre-off` still reads `Disabled`. The refused second
-freeze left no `m2.json` behind. The `--status` call between the freeze and the thaw printed
-`OFF` for `a` and `b` and exited 0. The lines are cut only where the text says so.
+After the thaw, `a` and `b` read `Ready` and `pre-off` still reads `Disabled`. The two refused
+freezes left no `m2.json`, and only `m.json` was in the folder at the end. The `--status` call
+between the freeze and the thaw printed `OFF` for `a` and `b`, a `left` line for `pre-off`, and
+exited 0.
 
 ## What already exists
 
@@ -108,10 +139,11 @@ Windows already ships the switch. This tool adds the record and the refusals aro
   Administrators group
   ([schtasks change](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-change)).
   This tool calls exactly this command.
-- **Other GitHub projects.** `gh search repos` on 2026-10-23 for `taskfreeze`, `freeze scheduled
-  tasks`, `disable scheduled tasks restore manifest`, `task scheduler freeze thaw`,
-  `schtasks disable enable` and `scheduled task maintenance window pause resume` returned empty
-  lists. A search for `disable-scheduledtask` found
+- **Other GitHub projects.** `gh search repos` on 2026-10-23, before this repository was
+  published, for `taskfreeze`, `freeze scheduled tasks`, `disable scheduled tasks restore
+  manifest`, `task scheduler freeze thaw`, `schtasks disable enable` and `scheduled task
+  maintenance window pause resume` returned empty lists. The same search for `taskfreeze` now
+  returns this repository only. A search for `disable-scheduledtask` found
   `SkylineCommunications/SLC-AS-Enable-Disable-ScheduledTasks`, a C# repository with no
   description and a readme that holds only its title, so this README cannot say what it does. That shows only that the search found
   nothing. It does not show that nothing exists.
@@ -167,8 +199,9 @@ lone backslash gets that hint in its error message.
 | `--self-test` | Run the offline assertions and exit. |
 
 The parser has `allow_abbrev=False`. A prefix such as `--ap` is refused with exit 64 instead of
-running as `--apply`. The self-test pins `--ap`, `--app` and `--appl`, and a prefix of every other
-long flag.
+running as `--apply`. The self-test pins `--ap`, `--app` and `--appl`, and one prefix of every
+other long flag: `--na`, `--act`, `--exc`, `--man`, `--th`, `--stat`, `--from`, `--sch`, `--sel`
+and `--he`.
 
 Exit codes:
 
@@ -214,42 +247,45 @@ in a JSON file and can be told to fail, to ignore a change, to change and then e
 taskfreeze self-test: temporary files and a stand-in schtasks, no network
 --------------------------------------------------------------------
 PASS  a disabled task whose triggers all say Enabled true is still disabled  <-- pinned defect
+PASS  an ENABLED task whose trigger says Enabled false is still enabled, so a freeze does not skip it as already off  <-- pinned defect
 PASS  an empty listing is refused, not read as zero tasks  <-- pinned defect
 ...
+PASS  --action reads the command text, never the task path  <-- pinned defect
 PASS  a freeze whose matches are all already off is REFUSED, because its manifest would be empty  <-- pinned defect
 PASS  a freeze onto a manifest that exists is REFUSED  <-- pinned defect
 ...
 PASS  the task that was off BEFORE the freeze is still off after the thaw  <-- pinned defect
 PASS  a second thaw is REFUSED and does not re-enable a task disabled since  <-- pinned defect
+PASS  drift in the FIRST frozen task is not hidden by a clean last one  <-- pinned defect
 ...
-PASS  a /change that exits 0 and changes nothing is UNVERIFIED and is not recorded  <-- pinned defect
-PASS  a /change that errors after taking effect is recorded, so the thaw restores it  <-- pinned defect
-...
-PASS  --thaw of an empty manifest exits 3, never '0 of 0 restored'  <-- pinned defect
+PASS  write_new onto an existing file raises  <-- pinned defect
+PASS  write_replace writes a sibling file and swaps it in, so the record is never half written  <-- pinned defect
 ...
 PASS  the prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 ...
 PASS  check() and raises() record failures, and the footer names them and exits 1  <-- pinned defect
 PASS  an all-green harness exits 0 with the 0 failed footer
 --------------------------------------------------------------------
-179 assertions, 0 failed
+192 assertions, 0 failed
 ```
 
-The full run prints all 179 assertions. Each `...` line is where this block is cut.
+The full run prints all 192 assertions. Each `...` line is where this block is cut.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows 11 | 3.13 | 179, 0 failed |
-| Windows 11 | 3.12 | 179, 0 failed |
-| Windows 11 | 3.9.25 | 179, 0 failed |
-| Ubuntu | 3.12.3 | 179, 0 failed |
+| Windows 11 | 3.13 | 192, 0 failed |
+| Windows 11 | 3.12 | 192, 0 failed |
+| Windows 11 | 3.9.25 | 192, 0 failed |
+| Ubuntu | 3.12.3 | 192, 0 failed |
 
 The counts are equal because no assertion depends on the host. The default codec assertion checks
 `oem` on Windows and `utf-8` elsewhere in one assertion that passes on both.
 
-Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 893
-statements, 202 branches, 0 missed, 100 percent. `coverage` is not installed on the Linux host, so
-Linux coverage was not measured. `pyflakes` is clean and `python -W error` compiles the file.
+Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 941
+statements, 204 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
+The `__main__` guard is covered by running the file through `runpy`, once as `__main__` and once
+under another name. `coverage` is not installed on the Linux host, so Linux coverage was not
+measured. `pyflakes` is clean and `python -W error` compiles the file.
 
 ### Do the assertions fail when the logic is wrong
 
@@ -261,8 +297,14 @@ the self-test fail:
 | Drop the refusal when no matched task is enabled | 2 |
 | Drop the "already thawed" refusal | 3 |
 | Let the thaw also walk `already_off` | 14 |
-| Set `allow_abbrev=True` | 6 |
+| Set `allow_abbrev=True` | 7 |
 | Drop the empty-`disabled` check in manifest validation | 4 |
+| Read any `Enabled` element in a task, not only `Settings/Enabled` | 1 |
+| Match `--action` against the task path | 1 |
+| Let only the last frozen task decide drift in `--status` | 1 |
+| Open the record with mode `w` instead of `x` | 2 |
+| Write the record in place, with no temporary file | 1 |
+| Stamp local time instead of UTC | 1 |
 
 ## Why the obvious version is wrong
 
@@ -289,7 +331,7 @@ that. The self-test has a stand-in that does each of the four things, and one as
 
 ## Limits
 
-- Every line and branch of the script ran in the self-test, so no line is excluded from the
+- Every line and branch of the script ran in the self-test, and no line is excluded from the
   coverage figure. The subprocess calls in the self-test go to a stand-in program, not to the real
   `schtasks`. The real `schtasks` was exercised by the session above, which is not part of the
   self-test because it creates scheduled tasks.
@@ -299,6 +341,51 @@ that. The self-test has a stand-in that does each of the four things, and one as
 - The record is a plain file. Anyone who can write it can change what the thaw does. The tool
   validates the record but does not sign it.
 - The self-test covers the network-free design only. The tool has no network path.
+- If the scheduler program fails with nothing on stderr, its stdout is shown in the error message,
+  so a task argument that holds a secret can appear on screen. The real `schtasks` wrote its
+  errors to stderr in every case tried.
+- The record keeps your patterns as typed, so never put a secret in one.
+- Run it from a directory you trust, or pass `--schtasks` with a full path. The default is the
+  bare name `schtasks`, and Windows searches the current directory when it resolves a bare name.
+- Run it from cmd or PowerShell. Git Bash alters backslashes in the pattern, so `[\\]` fails to
+  compile there and the tool exits 64.
+- A task name with characters outside the OEM code page may be listed under a best-fit ASCII name,
+  and the freeze then reports that task FAILED.
+- Several tasks in one folder with names outside the OEM code page can make the listing look like
+  repeated names, and the tool then refuses to run.
+- A freeze refuses the whole run if any matched name holds a character the console code page
+  cannot carry. Narrow the pattern or use `--except` for that task.
+- Task names match by simple lower-casing, not by full Unicode case folding.
+- `--action` sees only program actions. A task with a COM handler, an email or a message action
+  has empty action text and is never selected by `--action`.
+- A non-elevated run listed the same tasks as `schtasks /query /fo csv` by name on the test
+  machine. Whether an unelevated run hides other users' tasks was not verified.
+- A `--name` pattern that backtracks without limit can hang the tool.
+- A dry run does not check that the manifest path can be created. The `--apply` run then exits 2
+  before any change.
+- A manifest that could not be fully written must be deleted by hand before the freeze is
+  retried. No task is changed in that case.
+- The trim and thaw steps write `MANIFEST.tmp` beside the record and replace any file with that
+  name. A crash between the write and the rename leaves that file behind.
+- The self-test checks that the exclusive create refuses an existing file. It does not start two
+  freezes at the same instant on one path.
+- Thaw every manifest you wrote, newest first. A task frozen by an earlier manifest is listed as
+  already off in a later one, and the tool does not warn that another live freeze exists.
+- A thaw enables every task in the manifest, even one an administrator disabled again during the
+  window. Only a second thaw of the same manifest is refused.
+- After a partial thaw, a task disabled on purpose before the re-run is enabled again.
+- If another administrator disables a task between the plan and the read-back, a failed `/change`
+  for that task is recorded and a later thaw enables it.
+- If the tool is killed in the middle of a freeze, the record lists every task it meant to
+  disable, including ones it never reached. The thaw reports those as already enabled, which is
+  harmless. Ctrl+C is not caught: the process ends with a traceback instead of exit code 70.
+- Exit 1 means both "a change failed" and "drift found".
+- Save the record as UTF-8 without a byte-order mark. A record with one fails to parse and the
+  tool exits 2.
+- A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
+- `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
+  UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
+- The self-test writes Python bytecode beside the script. `.gitignore` excludes it.
 
 ## Contributing
 
