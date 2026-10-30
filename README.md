@@ -25,8 +25,9 @@ Two things go wrong, and both show up weeks later.
   back on, and it runs against a source that no longer exists.
 
 This tool refuses both. A freeze that has nothing to disable exits 3 and writes no file. A freeze
-never overwrites a record that exists. A task stays in the record only if the tool saw it
-enabled, disabled it, and read it back as disabled. The thaw touches only the tasks in the record.
+never overwrites a record that exists. A task is in the record only if the tool saw it enabled.
+When the read-back works, only tasks that read back as disabled stay in it. The thaw touches only
+the tasks in the record, so it never enables a task that was off before the freeze.
 A record that was already thawed cannot be thawed again, because the second thaw could enable a
 task that someone disabled in the meantime.
 
@@ -165,8 +166,10 @@ Three details decide whether a task counts as enabled.
   ([Enabled, settingsType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-enabled-settingstype-element)).
   A trigger has its own `Enabled` element. Read that one by mistake and a disabled task looks
   live. The self-test pins this.
-- **A missing element means enabled.** That is the schema default. On the Windows 11 machine used
-  here, `schtasks /query /xml` left the element out of every task that was enabled.
+- **A missing element means enabled.** The schema default applies to an empty element, not to an
+  absent one, so the schema alone does not settle this. The basis is a live check: on the Windows
+  11 machine used here, `schtasks /query /xml` left the element out of every task that was
+  enabled.
 - **The value must be a legal `xs:boolean`.** The lexical space is `true`, `false`, `1` and `0`, and
   white space is collapsed ([XML Schema 1.1 Part 2, section 3.3.2](https://www.w3.org/TR/xmlschema11-2/#boolean)).
   Anything else, including `FALSE`, stops the run with an error. A guess could read a disabled task
@@ -232,7 +235,10 @@ a repeated task, a task path with no leading backslash, or an unknown `version`.
 4. Keep in the record only the tasks that read back as disabled. A `/change` that reported an
    error but took effect is kept, so the thaw restores it. A `/change` that reported success but
    changed nothing is dropped and reported as `UNVERIFIED`. If nothing was disabled, the record is
-   removed and the exit code is 1.
+   removed and the exit code is 1. If the read-back itself fails, the tool cannot tell which
+   changes took effect. It keeps every attempted task, prints the reason and exits 2. Every kept
+   task was enabled before the freeze, so a later thaw can only enable a task that was already
+   live. `--status` shows which of them are still enabled.
 
 The thaw reads back the same way. It marks the record thawed only when every listed task is
 enabled, so a re-run after a partial thaw retries the rest.
@@ -347,8 +353,9 @@ that. The self-test has a stand-in that does each of the four things, and one as
 - The record keeps your patterns as typed, so never put a secret in one.
 - Run it from a directory you trust, or pass `--schtasks` with a full path. The default is the
   bare name `schtasks`, and Windows searches the current directory when it resolves a bare name.
-- Run it from cmd or PowerShell. Git Bash alters backslashes in the pattern, so `[\\]` fails to
-  compile there and the tool exits 64.
+- Run it from cmd or PowerShell. A POSIX shell, including Git Bash, halves the backslashes inside
+  double quotes, so `"^[\\]Nightly[\\]"` reaches the tool as `^[\]Nightly[\]`, fails to compile
+  and the tool exits 64. Single quotes keep the backslashes: `'^[\\]Nightly[\\]'`.
 - A task name with characters outside the OEM code page may be listed under a best-fit ASCII name,
   and the freeze then reports that task FAILED.
 - Several tasks in one folder with names outside the OEM code page can make the listing look like
@@ -385,6 +392,25 @@ that. The self-test has a stand-in that does each of the four things, and one as
 - A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
 - `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
   UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
+- The self-test takes about half a minute because it waits for a stand-in scheduler to time out.
+- The self-test runs only from a file named `taskfreeze.py`, because the stand-in scheduler
+  imports it by that name. A renamed copy exits 70 with `ModuleNotFoundError`.
+- A task name with leading or trailing spaces is addressed without them, so the change fails or
+  hits a different task. The freeze reports that task FAILED.
+- When the console code page differs from the OEM page, for example after `chcp 65001`, `schtasks`
+  writes names in the console page and the tool decodes them with the OEM page. A name such as
+  `cafe` with an accent then reads as mojibake. The freeze reports it FAILED and a thaw or status
+  reports it MISSING. No task is wrongly disabled or enabled.
+- A `Settings/Enabled` element that has a child element is reported as `None` instead of its
+  content. The run is refused, so only the message is poor.
+- A task disabled by someone else between the plan and the change is recorded as frozen by this
+  tool, and the thaw then enables it.
+- If the tool is killed after the record is written but before the changes, and an administrator
+  then disables a listed task on purpose, the thaw enables it.
+- A freeze that overlaps an earlier live freeze gets no warning unless every matched task is
+  already off. The second record then lists the first freeze's tasks as left alone.
+- The `schtasks /run` and `/s` behaviour and the Administrators requirement were not re-run for
+  this README.
 - The self-test writes Python bytecode beside the script. `.gitignore` excludes it.
 
 ## Contributing
