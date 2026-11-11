@@ -950,6 +950,7 @@ def fixture_xml(specs, declaration=True):
 # disabled, "words" forces a Status word, "dup" repeats a task's row, "csv_drop" omits a
 # task, "csv_fail" makes the CSV query exit 1 and "csv_junk" makes it print a bad row.
 STUB_SOURCE = '''import csv, json, sys, time
+sys.dont_write_bytecode = True
 sys.path.insert(0, %r)
 import taskfreeze
 state_path = sys.argv[1]
@@ -1510,6 +1511,19 @@ def _self_test(tmp):
             spec("\\Nightly\\Reconcile", False), spec("\\Nightly\\Compress"),
             spec("\\Other\\Backup"), spec("\\Caf\u00e9")]
     put_state(base)
+
+    # The stand-in imports the script by name. It must not leave bytecode beside it, because
+    # nothing may write to the tool's directory without --apply.
+    pkg_dir = os.path.join(tmp, "pkgcopy")
+    os.mkdir(pkg_dir)
+    shutil.copyfile(os.path.abspath(__file__), os.path.join(pkg_dir, "taskfreeze.py"))
+    stub_copy = os.path.join(tmp, "stub_copy.py")
+    with open(stub_copy, "w", encoding="utf-8") as fh:
+        fh.write(STUB_SOURCE % pkg_dir)
+    probe = subprocess.run([sys.executable, stub_copy, state_path, "/query", "/xml"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check(probe.returncode == 0 and not os.path.exists(os.path.join(pkg_dir, "__pycache__")),
+          "the stand-in schtasks writes no bytecode beside the script  <-- pinned defect")
     listed = sched().list_tasks()
     check(len(listed) == 5 and listed[1].enabled is False,
           "Schtasks.list_tasks reads a real subprocess listing")
