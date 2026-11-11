@@ -1,8 +1,8 @@
 # taskfreeze
 
 Disable a set of Windows scheduled tasks for a maintenance window, and later turn back on exactly
-the ones it turned off. It refuses to write an empty record, and it never enables a task that was
-already off before the freeze.
+the ones it turned off. It refuses to write an empty record, it never enables a task that was
+already off before the freeze, and it never reports a freeze while a task it disabled still runs.
 
 The script everyone writes for a maintenance window looks like this:
 
@@ -14,7 +14,7 @@ $tasks | Disable-ScheduledTask
 Import-Clixml freeze.xml | Enable-ScheduledTask
 ```
 
-Two things go wrong, and both show up weeks later.
+Three things go wrong, and all three show up after the fact.
 
 - **The second freeze.** The window slips a day, someone runs the freeze again, and every task is
   already off. The script finds no enabled task and writes a record of zero tasks over the first
@@ -23,9 +23,16 @@ Two things go wrong, and both show up weeks later.
 - **The blanket enable.** The thaw enables "everything in scope". One task in that folder was
   switched off on purpose a year ago, because the feed it reads was retired. The window turns it
   back on, and it runs against a source that no longer exists.
+- **The task that was running.** The nightly load started at 01:50. The freeze ran at 02:00 and
+  disabled it. Disabling a task does not stop the run in progress, so the load kept writing into
+  the tables that the patch was about to change. The script printed "frozen" and the patch
+  started underneath it.
 
-This tool refuses both. A freeze that has nothing to disable exits 3 and writes no file. A freeze
-never overwrites a record that exists. A task is in the record only if the tool saw it enabled.
+This tool refuses all three. A freeze that has nothing to disable exits 3 and writes no file.
+A freeze with a task that runs now exits 3 and changes nothing, unless you give `--wait SECONDS`.
+With `--wait` it disables the tasks, waits up to that long for the running ones to end, and prints
+`NOT FROZEN` with exit 1 if one still runs. A freeze never
+overwrites a record that exists. A task is in the record only if the tool saw it enabled.
 When the read-back works, only tasks that read back as disabled stay in it. The thaw touches only
 the tasks in the record, so it never enables a task that was off before the freeze.
 A record that was already thawed cannot be thawed again, because the second thaw could enable a
@@ -34,6 +41,8 @@ task that someone disabled in the meantime.
 ```
 python taskfreeze.py --name "^[\\]Nightly[\\]" --manifest freeze1.json            # plan only
 python taskfreeze.py --name "^[\\]Nightly[\\]" --manifest freeze1.json --apply    # freeze
+python taskfreeze.py --name "^[\\]Nightly[\\]" --manifest freeze1.json --apply --wait 300
+                                                                                  # freeze, wait up to 5 minutes for running tasks
 python taskfreeze.py --status freeze1.json                                        # read only
 python taskfreeze.py --thaw freeze1.json --apply                                  # restore
 ```
@@ -44,9 +53,10 @@ there.
 
 ## What a real run looks like
 
-This is a real session on Windows 11 (build 26100), run on 2026-10-24 against three scratch tasks
+This is a real session on Windows 11 (build 26100), run on 2026-11-10 against three scratch tasks
 that the run created and deleted afterwards. Two were enabled (`a`, `b`). One (`pre-off`) was
-disabled before the freeze. The pattern is `^[\\]taskfreeze-dev[\\]`.
+disabled before the freeze. The pattern is `^[\\]taskfreeze-dev[\\]`. The timestamp in the last
+thaw is UTC, so it reads 2026-11-11 for a run on the evening of 2026-11-10 local time.
 
 Nothing is cut. Standard output and standard error are merged, as a pipe delivers them. Standard
 error is unbuffered, so a `refused:` line can print before the standard output lines of the same
@@ -99,7 +109,8 @@ $ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m3.json --ap
 usage: taskfreeze [-h] [--name NAME] [--action ACTION]
                   [--except EXCEPT_PATTERN] [--manifest MANIFEST]
                   [--thaw MANIFEST] [--status MANIFEST] [--from-xml FILE]
-                  [--schtasks PROGRAM] [--apply] [--self-test]
+                  [--wait SECONDS] [--poll SECONDS] [--schtasks PROGRAM]
+                  [--apply] [--self-test]
 taskfreeze: error: unrecognized arguments: --ap
 rc=64
 
@@ -113,7 +124,7 @@ enabled  \taskfreeze-dev\b
 rc=0
 
 $ taskfreeze --thaw m.json --apply
-refused: this manifest was already thawed at 2026-10-24T21:45:37Z. A second thaw could re-enable a task someone has disabled since.
+refused: this manifest was already thawed at 2026-11-11T01:55:05Z. A second thaw could re-enable a task someone has disabled since.
 rc=3
 
 "\taskfreeze-dev\a","1/1/2031 11:59:00 PM","Ready"
@@ -125,6 +136,146 @@ After the thaw, `a` and `b` read `Ready` and `pre-off` still reads `Disabled`. T
 freezes left no `m2.json`, and only `m.json` was in the folder at the end. The `--status` call
 between the freeze and the thaw printed `OFF` for `a` and `b`, a `left` line for `pre-off`, and
 exited 0.
+
+## Running tasks
+
+Disabling a task does not stop a run that has started. On Windows 11 the Status of a task read
+`Running` after `schtasks /change /disable` had succeeded, and kept reading `Running` until
+`schtasks /end` ended the instance. A freeze that disables a running load and then reports
+"frozen" lets the load keep writing while the patch starts. The tool reads the run state and
+does one of three things.
+
+1. **No `--wait`: refuse.** If a task it would disable runs now, the freeze exits 3 before it
+   changes anything. A plan without `--apply` exits 3 too, so a dry run shows the refusal.
+2. **`--wait SECONDS`: disable, then wait.** The tool disables first, so no new instance can
+   start, then checks every `--poll` seconds (default 5) until every task it froze is idle or the
+   time is up. Waiting first would leave the tasks enabled, and a trigger could start a fresh run
+   during the wait. The limit is 3600 seconds.
+3. **Still running at the deadline: NOT FROZEN.** The tool exits 1, prints `NOT FROZEN` and prints
+   no `froze` line. The tasks stay disabled and in the record, so a thaw restores them.
+   `--status` shows each one as `RUNNING` and counts it as drift until it ends. The tool never
+   ends an instance itself. `schtasks /end` does that, and killing a run in the middle of a write
+   is a decision for the person at the keyboard.
+
+The tool also checks after every freeze, even when nothing ran at the start, because a trigger
+can fire between the plan and the disable. It never reads an unreadable run state as idle. A
+status word it does not know, a task missing from the run listing, and a failed read all stop the
+run: before any change they exit 3 (unknown word, missing task) or 2 (failed read), and after the
+changes the freeze reports `NOT FROZEN` (exit 1) or exits 2.
+
+This is a real session on the same machine, run on 2026-11-10 with the same merging of output as
+above. `long` runs `ping -n 120`, so it is still running when the first wait ends. `short` runs
+`ping -n 6` and ends inside its wait. `idle` and `pre-off` do nothing. After the first thaw the
+driver disabled `long` by hand and excluded it with `--except`, so the second freeze involves
+`short` only. The last two lines come from `schtasks /query /fo csv /nh` and from a count of
+scratch tasks left after the driver deleted them.
+
+```
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json
+refused: 1 task(s) run now (\taskfreeze-dev\long). Disabling a task does not stop a running instance, so it would keep writing during the window. Add --wait SECONDS to wait for them, or end them with schtasks /end.
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+matched 2 enabled and 1 already disabled task(s); nothing was changed.
+rc=3
+
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json --apply
+refused: 1 task(s) run now (\taskfreeze-dev\long). Disabling a task does not stop a running instance, so it would keep writing during the window. Add --wait SECONDS to wait for them, or end them with schtasks /end.
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+matched 2 enabled and 1 already disabled task(s); nothing was changed.
+rc=3
+
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json --wait 3 --poll 1
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+disable  \taskfreeze-dev\idle
+disable  \taskfreeze-dev\long
+running  \taskfreeze-dev\long  (an instance runs now; disabling does not stop it)
+1 running. After the change the tool waits up to 3 s, polling every 1 s, and reports NOT FROZEN if one still runs.
+2 to disable, 1 already off and left alone. Manifest: m.json
+nothing changed. Add --apply to disable them.
+rc=0
+
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest m.json --apply --wait 3 --poll 1
+RUNNING  \taskfreeze-dev\long: disabled, but an instance still runs and keeps writing. End it with schtasks /end, then check --status.
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+disable  \taskfreeze-dev\idle
+disable  \taskfreeze-dev\long
+running  \taskfreeze-dev\long  (an instance runs now; disabling does not stop it)
+1 running. After the change the tool waits up to 3 s, polling every 1 s, and reports NOT FROZEN if one still runs.
+2 to disable, 1 already off and left alone. Manifest: m.json
+disabled \taskfreeze-dev\idle
+disabled \taskfreeze-dev\long
+NOT FROZEN: 2 of 2 task(s) disabled, but 1 still running and 0 could not be read. Manifest: m.json
+rc=1
+
+$ taskfreeze --status m.json
+OFF      \taskfreeze-dev\idle
+RUNNING  \taskfreeze-dev\long  <-- drift
+left     \taskfreeze-dev\pre-off  (off before the freeze, off now)
+DRIFT: 2 task(s) in the manifest
+rc=1
+
+$ taskfreeze --status m.json
+OFF      \taskfreeze-dev\idle
+OFF      \taskfreeze-dev\long
+left     \taskfreeze-dev\pre-off  (off before the freeze, off now)
+ok: 2 task(s) in the manifest
+rc=0
+
+$ taskfreeze --thaw m.json --apply
+enable   \taskfreeze-dev\idle
+enable   \taskfreeze-dev\long
+left     \taskfreeze-dev\pre-off  (off before the freeze, stays off)
+enabled  \taskfreeze-dev\idle
+enabled  \taskfreeze-dev\long
+2 of 2 task(s) in the manifest are enabled: 2 enabled now, 0 already on, 0 missing
+rc=0
+
+$ taskfreeze --name ^[\\]taskfreeze-dev[\\] --except long --manifest m2.json --apply --wait 30 --poll 1
+leave    \taskfreeze-dev\pre-off  (already disabled, stays as it is)
+disable  \taskfreeze-dev\idle
+disable  \taskfreeze-dev\short
+running  \taskfreeze-dev\short  (an instance runs now; disabling does not stop it)
+1 running. After the change the tool waits up to 30 s, polling every 1 s, and reports NOT FROZEN if one still runs.
+2 to disable, 1 already off and left alone. Manifest: m2.json
+disabled \taskfreeze-dev\idle
+disabled \taskfreeze-dev\short
+finished \taskfreeze-dev\short
+froze 2 of 2 task(s). Manifest: m2.json
+rc=0
+
+$ taskfreeze --thaw m2.json --apply
+enable   \taskfreeze-dev\idle
+enable   \taskfreeze-dev\short
+left     \taskfreeze-dev\pre-off  (off before the freeze, stays off)
+enabled  \taskfreeze-dev\idle
+enabled  \taskfreeze-dev\short
+2 of 2 task(s) in the manifest are enabled: 2 enabled now, 0 already on, 0 missing
+rc=0
+
+after, from schtasks /query /fo csv /nh:
+"\taskfreeze-dev\idle","1/1/2031 11:59:00 PM","Ready"
+"\taskfreeze-dev\long","N/A","Disabled"
+"\taskfreeze-dev\pre-off","N/A","Disabled"
+"\taskfreeze-dev\short","1/1/2031 11:59:00 PM","Ready"
+leftover scratch tasks: 0
+```
+
+Every step in that session ran on real `schtasks`. The self-test runs the same cases against a stand-in:
+
+| Claim | Real Windows | Self-test |
+|---|---|---|
+| A running task with no `--wait` refuses the freeze, exit 3, nothing changed | session, steps 1 and 2 | yes |
+| A plan with `--wait` lists the running task and changes nothing | session, step 3 | yes |
+| A task that ends inside the wait gives `froze` and exit 0 | session, `short` | yes |
+| A task still running at the deadline gives `NOT FROZEN`, exit 1, record kept | session, `long` | yes |
+| `--status` shows a disabled task that still runs as `RUNNING` drift, and is clean after it ends | session | yes |
+| A task that starts between the plan and the disable gives `NOT FROZEN` | not run: the window cannot be hit on demand | yes, `start_on_change` |
+| An unknown status word or a missing row refuses the freeze, exit 3 | not run: no unknown word appeared | yes |
+| An unreadable run state exits 2 before any change, and `--thaw` does not need it | not run | yes |
+| A task with one row per trigger is read by its busiest row | observed: 280 rows for 203 tasks, no differing status | yes |
+| A disabled task keeps `Running` until its instance ends | session | modelled by the stand-in only |
+| A task in the `Queued` state counts as running | not run: no queued task was made | yes, as a word |
+
+How the run state is read, and what Microsoft documents about it, is in the next sections.
 
 ## What already exists
 
@@ -140,6 +291,15 @@ Windows already ships the switch. This tool adds the record and the refusals aro
   Administrators group
   ([schtasks change](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-change)).
   This tool calls exactly this command.
+- **`schtasks /end` and `Stop-ScheduledTask`.** They end a running instance. The `schtasks end`
+  page says it "stops only the instances of a program started by a scheduled task"
+  ([schtasks end](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-end)).
+  The `Stop-ScheduledTask` page says it "immediately stops all running instances of a registered
+  background task"
+  ([Stop-ScheduledTask](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/stop-scheduledtask)).
+  Both are the right tool when you decide a run may be cut off. The `Disable-ScheduledTask` page
+  says nothing about a running instance, which is the gap this tool closes by waiting or refusing.
+  This tool never calls either one.
 - **Other GitHub projects.** `gh search repos` on 2026-10-23, before this repository was
   published, for `taskfreeze`, `freeze scheduled tasks`, `disable scheduled tasks restore
   manifest`, `task scheduler freeze thaw`, `schtasks disable enable` and `scheduled task
@@ -147,7 +307,9 @@ Windows already ships the switch. This tool adds the record and the refusals aro
   returns this repository only. A search for `disable-scheduledtask` found
   `SkylineCommunications/SLC-AS-Enable-Disable-ScheduledTasks`, a C# repository with no
   description and a readme that holds only its title, so this README cannot say what it does. That shows only that the search found
-  nothing. It does not show that nothing exists.
+  nothing. It does not show that nothing exists. On 2026-11-10 `gh search repos` for `freeze
+  scheduled tasks running`, `disable scheduled tasks wait running` and `schtasks disable wait
+  running task` returned empty lists.
 
 ## Requirements
 
@@ -178,6 +340,30 @@ Three details decide whether a task counts as enabled.
 The listing is refused, not partly read, when it holds no task, repeats a task path, or holds a
 definition with no path comment above it. A task the selectors cannot see would never be frozen.
 
+## How the run state is read
+
+The tool runs `schtasks /query /fo csv /nh` as a second call. The query page documents `/fo` with
+`CSV` and says `/nh` "removes column headings from the table display" and is valid with the
+`TABLE` or `CSV` formats
+([schtasks query](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-query)).
+The page does not describe the columns. The three fields are the task path, the next run time
+and the Status, and that order was observed on Windows 11, not read from the documentation.
+
+- **The states.** The `TASK_STATE` enumeration has five members: Unknown, Disabled, Queued, Ready
+  and Running. Queued means "instances of the task are queued", and Running means "one or more
+  instances of the task is running"
+  ([TASK_STATE](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_state)).
+  The tool counts Running and Queued as busy, Ready and Disabled as idle, and every other word as
+  unknown.
+- **The words.** On the test machine the Status column held `Ready`, `Disabled` and `Running`. No
+  other word appeared, so the words `Queued` and `Could not start` are not confirmed by an
+  observation. Only the English words are known. The tool does not translate.
+- **One row per trigger.** The same query printed 280 rows for 203 tasks, because a task with
+  several triggers has one row for each. The tool keeps the worst word of the rows, busy over
+  unknown over idle.
+- **Not atomic.** The run state is a second call, made after the task listing. A task can start in
+  between. The check after the disable closes that gap for the tasks that were frozen.
+
 ## Usage
 
 A freeze selects tasks with `--name`, `--action`, or both. At least one is required: with neither,
@@ -197,23 +383,25 @@ lone backslash gets that hint in its error message.
 | `--thaw FILE` | Turn the tasks in this record back on. |
 | `--status FILE` | Compare the scheduler with this record. Read only. |
 | `--from-xml FILE` | Read a saved `schtasks /query /xml` listing. Read only: it cannot be combined with `--apply`. |
+| `--wait SECONDS` | A freeze waits up to this long, 0 to 3600, for running tasks to end. Without it a running task refuses the freeze. Freeze only. |
+| `--poll SECONDS` | Seconds between run-state checks while waiting, 0.05 to 60. Default 5. Freeze only. |
 | `--schtasks PROGRAM` | The scheduler program. Default `schtasks`. |
 | `--apply` | Change the scheduler and write the record. Without it, nothing is written. |
 | `--self-test` | Run the offline assertions and exit. |
 
 The parser has `allow_abbrev=False`. A prefix such as `--ap` is refused with exit 64 instead of
 running as `--apply`. The self-test pins `--ap`, `--app` and `--appl`, and one prefix of every
-other long flag: `--na`, `--act`, `--exc`, `--man`, `--th`, `--stat`, `--from`, `--sch`, `--sel`
-and `--he`.
+other long flag: `--na`, `--act`, `--exc`, `--man`, `--th`, `--stat`, `--from`, `--sch`, `--sel`,
+`--he`, `--wa` and `--po`.
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
 | 0 | Done, or a plan with nothing wrong. |
-| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, or is missing. `--status` also exits 1 on drift. |
-| 2 | The scheduler or a file could not be read or written. |
-| 3 | Refused: nothing to freeze, a record already exists, or the record is empty or spent. |
+| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs. |
+| 2 | The scheduler, the run state or a file could not be read or written. |
+| 3 | Refused: nothing to freeze, a record already exists, the record is empty or spent, a task runs and there is no `--wait`, or the run state of a task cannot be told. |
 | 64 | Usage error. |
 | 70 | An unexpected crash in the tool. |
 
@@ -227,8 +415,9 @@ a repeated task, a task path with no leading backslash, or an unknown `version`.
 
 ### Order of events in a freeze
 
-1. Read the scheduler and plan. Refuse if the record exists, nothing matched, a matched name lost a
-   character to the console code page, or no matched task is enabled.
+1. Read the scheduler and the run state, then plan. Refuse if the record exists, nothing matched,
+   a matched name lost a character to the console code page, no matched task is enabled, the run
+   state of an enabled matched task cannot be told, or one runs and there is no `--wait`.
 2. Create the record with mode `x`, which fails if the file exists. It is written before the first
    change, so a crash half way never leaves a disabled task with no record.
 3. Disable each task, then read the scheduler back.
@@ -240,14 +429,20 @@ a repeated task, a task path with no leading backslash, or an unknown `version`.
    task was enabled before the freeze, so a later thaw can only enable a task that was already
    live. `--status` shows which of them are still enabled.
 
-The thaw reads back the same way. It marks the record thawed only when every listed task is
+5. Read the run state of the tasks that stayed in the record, waiting up to `--wait` for the
+   running ones. If one still runs or cannot be read, print `NOT FROZEN` and exit 1. If the run
+   state cannot be read at all, exit 2. The record stays in both cases.
+
+The thaw reads back the same way. It does not read the run state. It marks the record thawed only when every listed task is
 enabled, so a re-run after a partial thaw retries the rest.
 
 ## Self-test
 
 `python taskfreeze.py --self-test` runs offline. It builds listings in the shape `schtasks` prints,
 and it drives the real subprocess path through a stand-in `schtasks` program that keeps its tasks
-in a JSON file and can be told to fail, to ignore a change, to change and then error, or to hang.
+in a JSON file. It can be told to fail, to ignore a change, to change and then error, to hang, to
+report a task as running for a set number of listings, to start a task when it is disabled, to
+report an odd status word, to repeat or drop a row, and to fail the run-state query.
 
 ```
 taskfreeze self-test: temporary files and a stand-in schtasks, no network
@@ -260,38 +455,45 @@ PASS  --action reads the command text, never the task path  <-- pinned defect
 PASS  a freeze whose matches are all already off is REFUSED, because its manifest would be empty  <-- pinned defect
 PASS  a freeze onto a manifest that exists is REFUSED  <-- pinned defect
 ...
+PASS  a freeze whose task runs is REFUSED without --wait, and a disabled task that runs is not counted  <-- pinned defect
+PASS  a task with one row per trigger is busy when a later row says Running  <-- pinned defect
+PASS  settle stops on the deadline, cuts the last sleep short and still reports the task busy  <-- pinned defect
+...
+PASS  a freeze with a running task and no --wait is REFUSED and changes nothing  <-- pinned defect
+PASS  a task still running when the wait ends is NOT FROZEN, exits 1 and never prints 'froze'  <-- pinned defect
+PASS  --status reports a disabled task that still runs as drift  <-- pinned defect
+PASS  a task that starts between the plan and the disable is caught by the final check  <-- pinned defect
+...
 PASS  the task that was off BEFORE the freeze is still off after the thaw  <-- pinned defect
 PASS  a second thaw is REFUSED and does not re-enable a task disabled since  <-- pinned defect
-PASS  drift in the FIRST frozen task is not hidden by a clean last one  <-- pinned defect
-...
-PASS  write_new onto an existing file raises  <-- pinned defect
-PASS  write_replace writes a sibling file and swaps it in, so the record is never half written  <-- pinned defect
 ...
 PASS  the prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 ...
 PASS  check() and raises() record failures, and the footer names them and exits 1  <-- pinned defect
 PASS  an all-green harness exits 0 with the 0 failed footer
 --------------------------------------------------------------------
-192 assertions, 0 failed
+263 assertions, 0 failed
 ```
 
-The full run prints all 192 assertions. Each `...` line is where this block is cut.
+The full run prints all 263 assertions. Each `...` line is where this block is cut.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows 11 | 3.13 | 192, 0 failed |
-| Windows 11 | 3.12 | 192, 0 failed |
-| Windows 11 | 3.9.25 | 192, 0 failed |
-| Ubuntu | 3.12.3 | 192, 0 failed |
+| Windows 11 | 3.13.2 | 263, 0 failed |
+| Windows 11 | 3.12.10 | 263, 0 failed |
+| Windows 11 | 3.9.25 | 263, 0 failed |
+| Ubuntu | 3.12.3 | 263, 0 failed |
 
 The counts are equal because no assertion depends on the host. The default codec assertion checks
-`oem` on Windows and `utf-8` elsewhere in one assertion that passes on both.
+`oem` on Windows and `utf-8` elsewhere in one assertion that passes on both. The run-state cases
+use a stand-in written in Python, so they do not need `schtasks` on Linux either.
 
-Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 941
-statements, 204 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
+Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 1207
+statements, 270 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
 The `__main__` guard is covered by running the file through `runpy`, once as `__main__` and once
 under another name. `coverage` is not installed on the Linux host, so Linux coverage was not
-measured. `pyflakes` is clean and `python -W error` compiles the file.
+measured. `pyflakes` is clean on Windows, and `python -W error` compiles the file on both hosts.
+`pyflakes` is not installed on the Linux host.
 
 ### Do the assertions fail when the logic is wrong
 
@@ -311,6 +513,18 @@ the self-test fail:
 | Open the record with mode `w` instead of `x` | 2 |
 | Write the record in place, with no temporary file | 1 |
 | Stamp local time instead of UTC | 1 |
+| Read an unknown status word as idle | 16 |
+| Keep the first row of a repeated task, not the busiest | 2 |
+| Do not refuse a freeze when a task runs | 6 |
+| Skip the final run check after the disable | 4 |
+| Ignore the run state in `--status` | 4 |
+| Read a task missing from the run listing as idle | 5 |
+| Do not cut the last sleep short at the deadline | 1 |
+| Print `froze` on the `NOT FROZEN` line | 3 |
+| Report a task whose disable failed as finished | 1 |
+
+The first eleven rows were measured before the run-state work, with 192 assertions. The last nine
+were measured with 263.
 
 ## Why the obvious version is wrong
 
@@ -323,11 +537,16 @@ The obvious thaw reads the exit status of `schtasks /change`. An exit of 0 does 
 changed, and an exit of 1 does not prove it did not. The tool reads the scheduler back and trusts
 that. The self-test has a stand-in that does each of the four things, and one assertion per case.
 
+The obvious freeze also reads "disabled" as "stopped". It is not: a run in progress goes on. This
+tool reads the run state after the disable and says `NOT FROZEN` while one remains.
+
 ## What it will not do
 
-- It does not stop a task that is running. This was checked on Windows 11: a task started with
-  `schtasks /run` read `Running`, `schtasks /change /disable` succeeded, and the task still read
-  `Running`. End a running instance yourself with `schtasks /end`.
+- It does not stop a task that is running. This was checked again on Windows 11 on 2026-11-10: a
+  task started with `schtasks /run` read `Running`, `schtasks /change /disable` succeeded, and
+  the task still read `Running` until `schtasks /end` ended it. The freeze refuses, waits, or
+  reports `NOT FROZEN` instead (see Running tasks). End a running instance yourself with
+  `schtasks /end`.
 - It does not work on a remote computer. `schtasks` has `/s`; this tool does not pass it.
 - It does not touch the tasks it did not select, and it does not delete a task.
 - It does not follow a task that someone renamed between the freeze and the thaw. The thaw reports
@@ -386,13 +605,14 @@ that. The self-test has a stand-in that does each of the four things, and one as
 - If the tool is killed in the middle of a freeze, the record lists every task it meant to
   disable, including ones it never reached. The thaw reports those as already enabled, which is
   harmless. Ctrl+C is not caught: the process ends with a traceback instead of exit code 70.
-- Exit 1 means both "a change failed" and "drift found".
+- Exit 1 means "a change failed", "drift found" and "a task still runs".
 - Save the record as UTF-8 without a byte-order mark. A record with one fails to parse and the
   tool exits 2.
 - A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
 - `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
   UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
-- The self-test takes about half a minute because it waits for a stand-in scheduler to time out.
+- The self-test takes about half a minute because it waits for a stand-in scheduler to time out,
+  and it sleeps about a second more in the wait cases.
 - The self-test runs only from a file named `taskfreeze.py`, because the stand-in scheduler
   imports it by that name. A renamed copy exits 70 with `ModuleNotFoundError`.
 - A task name with leading or trailing spaces is addressed without them, so the change fails or
@@ -409,8 +629,28 @@ that. The self-test has a stand-in that does each of the four things, and one as
   then disables a listed task on purpose, the thaw enables it.
 - A freeze that overlaps an earlier live freeze gets no warning unless every matched task is
   already off. The second record then lists the first freeze's tasks as left alone.
-- The `schtasks /run` and `/s` behaviour and the Administrators requirement were not re-run for
-  this README.
+- The `/s` behaviour and the Administrators requirement were not re-run for this README. The
+  `schtasks /run` and `/end` behaviour was re-run on 2026-11-10.
+- The run state is read as English words. On a Windows with another display language the words
+  differ, the tool reads them as unknown, and a freeze is refused with exit 3 instead of guessed.
+  This was not tried on a non-English machine.
+- `Queued` counts as running, because the `TASK_STATE` page says instances are queued. No queued
+  task was made on a real host, so the word `Queued` itself was not observed.
+- Microsoft does not document the Status column of `schtasks /query /fo csv`, so the field order
+  and the words rest on what Windows 11 printed. A later build could change them. The tool then
+  refuses or reports `NOT FROZEN`, and does not report a clean freeze.
+- The run state is a poll. The tool reports the state at the moment of the last read. A task
+  that another administrator or a group policy re-enables afterwards can start again, as with
+  the rest of the freeze. Run `--status` before the work.
+- The wait ends at the deadline with the tasks disabled. Nothing re-enables them, so a
+  `NOT FROZEN` run still needs a `--thaw` or a repeat of the freeze after the instance ends. A
+  repeat onto the same record path is refused, so use `--status` and then `--thaw`.
+- A task whose disable failed, or read back unchanged, is reported `FAILED` or `UNVERIFIED`. It
+  is not checked for a running instance, because it is not in the record.
+- Each poll lists every task on the machine. A machine with a very large scheduler makes each
+  poll slow, and `--poll` below the time one listing takes has no effect. This was not measured.
+- `--from-xml` holds no run state. A plan from it says `run state not checked`, and `--status`
+  from it prints `ok (run state not checked)`. It does not claim that nothing runs.
 - The self-test writes Python bytecode beside the script. `.gitignore` excludes it.
 
 ## Contributing

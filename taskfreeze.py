@@ -24,13 +24,21 @@ already off before the freeze. A manifest that has been thawed cannot be thawed 
 Reads the scheduler with `schtasks /query /xml` and changes it with
 `schtasks /change /tn NAME /disable` or `/enable`. Nothing is changed without --apply.
 The one file it writes is the manifest, through MANIFEST.tmp
-when it replaces the manifest. Local machine only. Disabling a task does not
-stop an instance that is already running.
+when it replaces the manifest. Local machine only.
+
+Disabling a task does not stop an instance that is already running, and a task that
+runs on keeps writing. The freeze reads the run state with `schtasks /query /fo csv /nh`.
+A task that runs when the freeze starts refuses the freeze (exit 3) unless --wait
+SECONDS is given. With --wait the tool disables the tasks first, so no new instance
+starts, then polls until the running ones end. A task that still runs when the time is
+up is reported as NOT FROZEN (exit 1). --status reports a disabled task that still runs
+as drift.
 
 Exit codes: 0 done, 1 not everything was done or verified (a task failed to change,
-did not read back as changed, or is missing), 2 the scheduler or a file could not be
+did not read back as changed, still runs, or is missing), 2 the scheduler or a file could not be
 read or written, 3 refused (nothing to freeze, a manifest already exists, an empty or
-spent manifest), 64 usage error, 70 an unexpected crash.
+spent manifest, a task runs or its run state cannot be told), 64 usage error, 70 an
+unexpected crash.
 
 Python 3.9+, standard library only.
 """
@@ -38,6 +46,7 @@ Python 3.9+, standard library only.
 import argparse
 import collections
 import contextlib
+import csv
 import io
 import json
 import os
@@ -47,12 +56,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 EXIT_OK = 0
 EXIT_PARTIAL = 1
@@ -64,9 +74,13 @@ EXIT_CRASH = 70
 MANIFEST_KIND = "taskfreeze-manifest"
 MANIFEST_VERSION = 1
 SCHEDULER_TIMEOUT = 120
+MAX_WAIT = 3600.0
+DEFAULT_POLL = 5.0
+MIN_POLL = 0.05
+MAX_POLL = 60.0
 
 Task = collections.namedtuple("Task", "name enabled actions")
-FreezePlan = collections.namedtuple("FreezePlan", "disable leave_off refusal")
+FreezePlan = collections.namedtuple("FreezePlan", "disable leave_off refusal running")
 ThawPlan = collections.namedtuple("ThawPlan", "enable already_on missing refusal")
 
 
@@ -200,14 +214,76 @@ def _by_name(names):
     return sorted(names, key=lambda n: n.lower())
 
 
-def plan_freeze(tasks, name_re, action_re, except_re, manifest_exists):
-    """Decide what a freeze would do. refusal is None or the reason it must not run."""
+# The Status column of `schtasks /query /fo csv /nh`. Windows documents the states in
+# TASK_STATE (Disabled, Queued, Ready, Running, Unknown) but does not document this
+# column, so the words below are the English ones seen on Windows 11. Any other word,
+# including one from another language, is "unknown" and is never read as idle.
+IDLE_STATUS = ("ready", "disabled")
+BUSY_STATUS = ("running", "queued")
+_RANK = {"idle": 0, "unknown": 1, "busy": 2}
+
+
+def classify_status(word):
+    """idle, busy or unknown for a Status word. None, an empty word and a word this tool
+    does not know are unknown, because guessing idle would report a frozen state while
+    a task runs."""
+    text = (word or "").strip().lower()
+    if text in BUSY_STATUS:
+        return "busy"
+    if text in IDLE_STATUS:
+        return "idle"
+    return "unknown"
+
+
+def parse_states(text):
+    """{lower-case task path: Status word} from `schtasks /query /fo csv /nh`. Raises
+    ValueError when a row is not (task path, next run, status) or the listing is empty.
+    A task with several triggers has one row per trigger, so a repeated task keeps its
+    worst word: busy over unknown over idle."""
+    states = {}
+    for row in csv.reader(io.StringIO(text)):
+        if not row:
+            continue
+        if len(row) != 3 or not row[0].startswith("\\"):
+            raise ValueError("a row is not task path, next run time, status: %r" % (row,))
+        key = row[0].lower()
+        old = states.get(key)
+        if old is None or _RANK[classify_status(row[2])] > _RANK[classify_status(old)]:
+            states[key] = row[2]
+    if not states:
+        raise ValueError("the listing holds no task")
+    return states
+
+
+def run_check(states, names):
+    """(busy, unknown) among names. A name missing from states is unknown."""
+    busy, unknown = [], []
+    for name in names:
+        kind = classify_status(states.get(name.lower()))
+        if kind == "busy":
+            busy.append(name)
+        elif kind == "unknown":
+            unknown.append(name)
+    return busy, unknown
+
+
+def _some(names, limit=5):
+    text = ", ".join(names[:limit])
+    return text + (" and %d more" % (len(names) - limit) if len(names) > limit else "")
+
+
+def plan_freeze(tasks, name_re, action_re, except_re, manifest_exists, states=None,
+                wait=0):
+    """Decide what a freeze would do. refusal is None or the reason it must not run.
+    states is the run state of every task, or None when it was not read (a saved
+    listing). running lists the tasks to disable that run now."""
     if name_re is None and action_re is None:
         raise ValueError("a freeze needs --name or --action; with neither it would "
                          "select every task")
     matched = select_tasks(tasks, name_re, action_re, except_re)
     disable = _by_name(t.name for t in matched if t.enabled)
     leave_off = _by_name(t.name for t in matched if not t.enabled)
+    running, unknown = run_check(states, disable) if states is not None else ([], [])
     refusal = None
     if manifest_exists:
         refusal = ("the manifest file already exists. A second freeze must not "
@@ -221,7 +297,16 @@ def plan_freeze(tasks, name_re, action_re, except_re, manifest_exists):
         refusal = ("every matched task is already disabled, so the manifest would be "
                    "empty and a thaw would restore nothing. A freeze may still be in "
                    "force: check --status on its manifest.")
-    return FreezePlan(disable, leave_off, refusal)
+    elif unknown:
+        refusal = ("the run state of %d task(s) could not be told (%s), so the tool "
+                   "cannot know whether they run. The run state is read in English."
+                   % (len(unknown), _some(unknown)))
+    elif running and not wait:
+        refusal = ("%d task(s) run now (%s). Disabling a task does not stop a running "
+                   "instance, so it would keep writing during the window. Add --wait "
+                   "SECONDS to wait for them, or end them with schtasks /end."
+                   % (len(running), _some(running)))
+    return FreezePlan(disable, leave_off, refusal, running)
 
 
 def build_manifest(plan, name_pattern, action_pattern, except_pattern, created):
@@ -300,9 +385,10 @@ def plan_thaw(manifest, tasks):
     return ThawPlan(_by_name(enable), _by_name(already_on), _by_name(missing), None)
 
 
-def status_report(manifest, tasks):
+def status_report(manifest, tasks, states=None):
     """(lines, drift). drift is True when a task is not in the state the manifest says:
-    off for a live freeze, on for a thawed one, or gone."""
+    off for a live freeze, on for a thawed one, or gone. With states, a task of a live
+    freeze that is off but still runs is drift too: the freeze has not stopped it."""
     index = _index(tasks)
     thawed = bool(manifest.get("thawed"))
     lines = []
@@ -315,6 +401,10 @@ def status_report(manifest, tasks):
             state, bad = "ON", not thawed
         else:
             state, bad = "OFF", thawed
+            kind = classify_status(states.get(name.lower())) if states is not None \
+                and not thawed else "idle"
+            if kind != "idle":
+                state, bad = ("RUNNING" if kind == "busy" else "UNKNOWN"), True
         drift = drift or bad
         lines.append("%-8s %s%s" % (state, name, "  <-- drift" if bad else ""))
     for name in _by_name(manifest["already_off"]):
@@ -379,6 +469,13 @@ class Schtasks(object):
         except ValueError as exc:
             raise SchedulerError("the scheduler listing is not usable: %s" % exc)
 
+    def list_states(self):
+        """Run state of every task: {lower-case path: Status word}."""
+        try:
+            return parse_states(self._run(["/query", "/fo", "csv", "/nh"]))
+        except ValueError as exc:
+            raise SchedulerError("the run-state listing is not usable: %s" % exc)
+
     def set_enabled(self, name, on):
         self._run(["/change", "/tn", name, "/enable" if on else "/disable"])
 
@@ -398,6 +495,10 @@ class Export(object):
             raise SchedulerError("cannot read %s: %s" % (self.path, exc))
         except ValueError as exc:
             raise SchedulerError("%s is not a usable listing: %s" % (self.path, exc))
+
+    def list_states(self):
+        """None: a saved listing holds no run state."""
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -450,9 +551,41 @@ def _after(scheduler, what):
         return None
 
 
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def settle(read, names, wait, poll, clock, sleep):
+    """(busy, unknown) among names after waiting at most wait seconds for the busy ones
+    to end. read returns the run states or raises SchedulerError. It reads at least
+    once, so a wait of 0 is one check. The last sleep is cut short to end on the
+    deadline."""
+    deadline = clock() + wait
+    while True:
+        busy, unknown = run_check(read(), names)
+        left = deadline - clock()
+        if not busy or left <= 0:
+            return busy, unknown
+        sleep(min(poll, left))
+
+
+def _read_states(scheduler, why):
+    """Run states, None for a saved listing, or False after a printed error."""
+    try:
+        return scheduler.list_states()
+    except SchedulerError as exc:
+        warn("error: cannot read the run state %s: %s" % (why, exc))
+        return False
+
+
 def _freeze(args, scheduler, tasks, patterns):
+    states = _read_states(scheduler, "of the tasks")
+    if states is False:
+        return EXIT_IO
+    wait = args.wait or 0.0
+    poll = args.poll or DEFAULT_POLL
     plan = plan_freeze(tasks, patterns[0], patterns[1], patterns[2],
-                       os.path.exists(args.manifest))
+                       os.path.exists(args.manifest), states, wait)
     for name in plan.leave_off:
         say("leave    %s  (already disabled, stays as it is)" % name)
     if plan.refusal:
@@ -462,6 +595,13 @@ def _freeze(args, scheduler, tasks, patterns):
         return EXIT_REFUSED
     for name in plan.disable:
         say("disable  %s" % name)
+    for name in plan.running:
+        say("running  %s  (an instance runs now; disabling does not stop it)" % name)
+    if states is None:
+        say("run state not checked: a saved listing holds none.")
+    elif plan.running:
+        say("%d running. After the change the tool waits up to %g s, polling every %g s, "
+            "and reports NOT FROZEN if one still runs." % (len(plan.running), wait, poll))
     say("%d to disable, %d already off and left alone. Manifest: %s"
         % (len(plan.disable), len(plan.leave_off), args.manifest))
     if not args.apply:
@@ -510,6 +650,26 @@ def _freeze(args, scheduler, tasks, patterns):
             warn("error: cannot trim the manifest: %s. It lists every task attempted."
                  % exc)
             return EXIT_IO
+    # Disabled first, so no new instance starts. A disable does not stop one that runs.
+    try:
+        busy, unknown = settle(scheduler.list_states, done, wait, poll, _clock, _sleep)
+    except SchedulerError as exc:
+        warn("error: cannot confirm that no task still runs: %s. The manifest lists the "
+             "disabled tasks. Check --status." % exc)
+        return EXIT_IO
+    for name in plan.running:
+        if name in done and name not in busy and name not in unknown:
+            say("finished %s" % name)
+    for name in busy:
+        warn("RUNNING  %s: disabled, but an instance still runs and keeps writing. End "
+             "it with schtasks /end, then check --status." % name)
+    for name in unknown:
+        warn("UNKNOWN  %s: its run state could not be told." % name)
+    if busy or unknown:
+        say("NOT FROZEN: %d of %d task(s) disabled, but %d still running and %d could not be "
+            "read. Manifest: %s" % (len(done), len(plan.disable), len(busy),
+                                    len(unknown), args.manifest))
+        return EXIT_PARTIAL
     say("froze %d of %d task(s). Manifest: %s" % (len(done), len(plan.disable),
                                                    args.manifest))
     return EXIT_OK if len(done) == len(plan.disable) else EXIT_PARTIAL
@@ -568,23 +728,43 @@ def _thaw(args, scheduler, tasks, manifest):
     return EXIT_OK
 
 
-def _status(manifest, tasks):
+def _status(scheduler, manifest, tasks):
     problem = manifest_problem(manifest)
     if problem:
         warn("refused: %s" % problem)
         return EXIT_REFUSED
-    lines, drift = status_report(manifest, tasks)
+    thawed = bool(manifest.get("thawed"))
+    states = None if thawed else _read_states(scheduler, "for the status")
+    if states is False:
+        return EXIT_IO
+    lines, drift = status_report(manifest, tasks, states)
     for line in lines:
         say(line)
+    unchecked = states is None and not thawed
     say("%s: %d task(s) in the manifest%s" % (
-        "DRIFT" if drift else "ok", len(manifest["disabled"]),
-        ", thawed at %s" % manifest["thawed"] if manifest.get("thawed") else ""))
+        "DRIFT" if drift else "ok" + (" (run state not checked)" if unchecked else ""),
+        len(manifest["disabled"]),
+        ", thawed at %s" % manifest["thawed"] if thawed else ""))
     return EXIT_PARTIAL if drift else EXIT_OK
 
 
 # ---------------------------------------------------------------------------
 # Command line.
 # ---------------------------------------------------------------------------
+
+def _seconds(low, high):
+    """argparse type: a number of seconds from low to high. nan and inf fail the range."""
+    def parse(text):
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("%r is not a number of seconds" % text)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError("%r is outside %g to %g seconds"
+                                             % (text, low, high))
+        return value
+    return parse
+
 
 def build_parser():
     ap = argparse.ArgumentParser(
@@ -603,6 +783,12 @@ def build_parser():
     ap.add_argument("--from-xml", dest="from_xml", metavar="FILE",
                     help="read a saved `schtasks /query /xml` listing instead of the "
                          "scheduler; read only, so it cannot be combined with --apply")
+    ap.add_argument("--wait", type=_seconds(0.0, MAX_WAIT), metavar="SECONDS",
+                    help="a freeze waits up to this long for running tasks to end; "
+                         "without it a running task refuses the freeze (max %g)" % MAX_WAIT)
+    ap.add_argument("--poll", type=_seconds(MIN_POLL, MAX_POLL), metavar="SECONDS",
+                    help="seconds between run-state checks while waiting (default %g)"
+                         % DEFAULT_POLL)
     ap.add_argument("--schtasks", default="schtasks", metavar="PROGRAM",
                     help="the schtasks program (default: schtasks)")
     ap.add_argument("--apply", action="store_true",
@@ -627,6 +813,8 @@ def usage_problem(args):
         return "a freeze needs --name or --action."
     if freeze and args.manifest is None:
         return "a freeze needs --manifest, the file that records what it disabled."
+    if (args.wait is not None or args.poll is not None) and not freeze:
+        return "--wait and --poll apply to a freeze only."
     if args.apply and args.status is not None:
         return "--status only reads. --apply does not apply to it."
     if args.apply and args.from_xml is not None:
@@ -695,7 +883,7 @@ def _run(argv, scheduler):
     if args.thaw is not None:
         return _thaw(args, scheduler, tasks, manifest)
     if args.status is not None:
-        return _status(manifest, tasks)
+        return _status(scheduler, manifest, tasks)
     return _freeze(args, scheduler, tasks, patterns)
 
 
@@ -735,8 +923,12 @@ def fixture_xml(specs, declaration=True):
 # A stand-in schtasks.exe. It keeps its tasks in a JSON state file and answers the two
 # calls the tool makes. "fail" lists tasks whose /change exits 1, "ignore" lists tasks
 # whose /change exits 0 and changes nothing, "partial" lists tasks whose /change takes
-# effect and then exits 1, "hang" makes every call sleep.
-STUB_SOURCE = '''import json, sys, time
+# effect and then exits 1, "hang" makes every call sleep. Run state: "busy" maps a task to
+# the number of /query /fo csv calls that still report it Running, a /change never ends
+# it (as on Windows), "start_on_change" lists tasks that start running when they are
+# disabled, "words" forces a Status word, "dup" repeats a task's row, "csv_drop" omits a
+# task, "csv_fail" makes the CSV query exit 1 and "csv_junk" makes it print a bad row.
+STUB_SOURCE = '''import csv, json, sys, time
 sys.path.insert(0, %r)
 import taskfreeze
 state_path = sys.argv[1]
@@ -747,6 +939,33 @@ if state.get("hang"):
     time.sleep(30)
 if argv == ["/query", "/xml"]:
     sys.stdout.buffer.write(taskfreeze.fixture_xml(state["tasks"]).encode("utf-8"))
+    sys.exit(0)
+if argv == ["/query", "/fo", "csv", "/nh"]:
+    if state.get("csv_fail"):
+        sys.stderr.write("ERROR: The run state is not available.\\n")
+        sys.exit(1)
+    if state.get("csv_junk"):
+        sys.stdout.write("one,two\\n")
+        sys.exit(0)
+    busy = state.setdefault("busy", {})
+    writer = csv.writer(sys.stdout, quoting=csv.QUOTE_ALL, lineterminator="\\r\\n")
+    for t in state["tasks"]:
+        name = t["name"]
+        if name in state.get("csv_drop", []):
+            continue
+        if name in state.get("words", {}):
+            word = state["words"][name]
+        elif busy.get(name, 0) > 0:
+            word = "Running"
+        else:
+            word = "Ready" if t["enabled"] else "Disabled"
+        writer.writerow([name, "N/A", word])
+        if name in state.get("dup", []):
+            writer.writerow([name, "1/1/2031 11:59:00 PM", "Ready"])
+    for name in busy:
+        busy[name] = max(0, busy[name] - 1)
+    with open(state_path, "w") as fh:
+        json.dump(state, fh)
     sys.exit(0)
 if len(argv) == 4 and argv[0] == "/change" and argv[1] == "/tn" and argv[3] in (
         "/enable", "/disable"):
@@ -760,6 +979,8 @@ if len(argv) == 4 and argv[0] == "/change" and argv[1] == "/tn" and argv[3] in (
         sys.exit(1)
     if name not in state.get("ignore", []):
         found[0]["enabled"] = argv[3] == "/enable"
+    if argv[3] == "/disable" and name in state.get("start_on_change", []):
+        state.setdefault("busy", {})[name] = 100000
     with open(state_path, "w") as fh:
         json.dump(state, fh)
     if name in state.get("partial", []):
@@ -1050,6 +1271,118 @@ def _self_test(tmp):
     lines, drift = status_report(two, [Task("\\a", False, ""), Task("\\b", False, "")])
     check(not drift, "a live freeze with every task still off is not drift")
 
+    # --- run state -------------------------------------------------------------
+    for word, want in (("Ready", "idle"), ("Disabled", "idle"), ("Running", "busy"),
+                       ("queued", "busy"), (" RUNNING ", "busy"),
+                       ("Could not start", "unknown"), ("", "unknown"), (None, "unknown"),
+                       ("Wird ausgef\u00fchrt", "unknown")):
+        check(classify_status(word) == want, "status word %a is %s%s" % (
+            word, want, ", never idle  <-- pinned defect" if want == "unknown" else ""))
+    csv_text = ('"\\A","N/A","Ready"\r\n"\\B, with comma","1/1/2031 11:59:00 PM",'
+                '"Running"\r\n\r\n"\\C","N/A","Disabled"\r\n')
+    check(parse_states(csv_text) == {"\\a": "Ready", "\\b, with comma": "Running",
+                                     "\\c": "Disabled"},
+          "parse_states reads a CSV listing, keeps a comma in a name, skips a blank line "
+          "and lower-cases the path")
+    check(parse_states('"\\T","N/A","Ready"\r\n"\\t","x","Running"\r\n') == {"\\t": "Running"},
+          "a task with one row per trigger is busy when a later row says Running  "
+          "<-- pinned defect")
+    check(parse_states('"\\T","N/A","Running"\r\n"\\T","x","Ready"\r\n') == {"\\t": "Running"},
+          "a task with one row per trigger is busy when an earlier row says Running  "
+          "<-- pinned defect")
+    check(parse_states('"\\T","N/A","Ready"\r\n"\\T","x","Could not start"\r\n')
+          == {"\\t": "Could not start"}, "an unknown word outranks an idle one")
+    raises(lambda: parse_states('"TaskName","Next Run Time","Status"\r\n'),
+           "a header row is refused, because it is not a task path")
+    raises(lambda: parse_states('"\\A","N/A"\r\n'), "a row with two fields is refused")
+    raises(lambda: parse_states("\r\n\r\n"), "a listing with no row is refused")
+    stat = {"\\a": "Running", "\\b": "Ready", "\\c": "Could not start"}
+    check(run_check(stat, ["\\A", "\\B", "\\C", "\\D"]) == (["\\A"], ["\\C", "\\D"]),
+          "run_check splits busy and unknown, ignores case, and counts a task missing from "
+          "the listing as unknown")
+    check(_some(list("abcdefg")) == "a, b, c, d, e and 2 more" and _some(["a"]) == "a",
+          "a long list of names is cut to five")
+    plan = plan_freeze(tasks, name_re, None, None, False,
+                       {"\\nightly\\load": "Running", "\\nightly\\reconcile": "Running"}, 0)
+    check(plan.refusal is not None and "run now" in plan.refusal and "--wait" in plan.refusal
+          and plan.running == ["\\Nightly\\Load"],
+          "a freeze whose task runs is REFUSED without --wait, and a disabled task that "
+          "runs is not counted  <-- pinned defect")
+    plan = plan_freeze(tasks, name_re, None, None, False, {"\\nightly\\load": "Running"}, 30)
+    check(plan.refusal is None and plan.running == ["\\Nightly\\Load"],
+          "with a wait the plan goes on and lists the running task")
+    plan = plan_freeze(tasks, name_re, None, None, False, {"\\nightly\\load": "Ready"}, 0)
+    check(plan.refusal is None and plan.running == [], "an idle task does not stop a freeze")
+    for label, given in (("an unknown word", {"\\nightly\\load": "Could not start"}),
+                         ("a task missing from the run listing", {})):
+        plan = plan_freeze(tasks, name_re, None, None, False, given, 30)
+        check(plan.refusal is not None and "could not be told" in plan.refusal,
+              "%s REFUSES the freeze even with a wait, because the tool cannot tell  "
+              "<-- pinned defect" % label)
+    plan = plan_freeze(tasks, name_re, None, None, False, None, 0)
+    check(plan.refusal is None and plan.running == [],
+          "no run state at all (a saved listing) checks nothing and refuses nothing")
+    check(plan_freeze(tasks, name_re, None, None, True, {"\\nightly\\load": "Running"},
+                      0).refusal.startswith("the manifest file already exists"),
+          "an existing manifest is named before a running task")
+    check("empty" in plan_freeze(alloff, compile_pattern("--name", "^.X"), None, None, False,
+                                 {}, 0).refusal,
+          "a freeze with nothing enabled is refused as empty before any run state is judged")
+    lines, drift = status_report(good, now_tasks, {"\\nightly\\load": "Running"})
+    check(drift and lines[0].startswith("RUNNING") and "<-- drift" in lines[0],
+          "a live freeze whose task is off but still runs is drift, not a clean freeze  "
+          "<-- pinned defect")
+    for given, word in (({"\\nightly\\load": "Ready"}, "OFF"),
+                        ({"\\nightly\\load": "Disabled"}, "OFF"),
+                        ({"\\nightly\\load": "Could not start"}, "UNKNOWN"),
+                        ({}, "UNKNOWN")):
+        lines, drift = status_report(good, now_tasks, given)
+        check(lines[0].startswith(word) and drift == (word != "OFF"),
+              "status reads the run state %r of an off task as %s" % (given, word))
+    lines, drift = status_report(thawed, now_tasks, {"\\nightly\\load": "Running"})
+    check(drift and lines[0].startswith("OFF"),
+          "a thawed manifest ignores the run state")
+
+    class Clock(object):
+        def __init__(self):
+            self.now_s = 0.0
+            self.slept = []
+
+        def now(self):
+            return self.now_s
+
+        def sleep(self, seconds):
+            self.slept.append(seconds)
+            self.now_s += seconds
+
+    def reads(*items):
+        queue = list(items)
+
+        def read():
+            item = queue.pop(0) if len(queue) > 1 else queue[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return read
+
+    run_on, run_off = {"\\a": "Running"}, {"\\a": "Ready"}
+    ck = Clock()
+    check(settle(reads(run_on, run_on, run_off), ["\\A"], 60, 5, ck.now, ck.sleep) == ([], [])
+          and ck.slept == [5, 5], "settle polls until the running task ends")
+    ck = Clock()
+    check(settle(reads(run_on), ["\\A"], 12, 5, ck.now, ck.sleep) == (["\\A"], [])
+          and ck.slept == [5, 5, 2] and ck.now_s == 12,
+          "settle stops on the deadline, cuts the last sleep short and still reports the "
+          "task busy  <-- pinned defect")
+    ck = Clock()
+    check(settle(reads(run_on), ["\\A"], 0, 5, ck.now, ck.sleep) == (["\\A"], [])
+          and ck.slept == [], "a wait of 0 is one check and never sleeps")
+    ck = Clock()
+    check(settle(reads({"\\a": "???"}), ["\\A"], 60, 5, ck.now, ck.sleep) == ([], ["\\A"])
+          and ck.slept == [], "an unknown state ends the wait at once and is reported")
+    raises(lambda: settle(reads(SchedulerError("gone")), ["\\A"], 60, 5, ck.now, ck.sleep),
+           "a run state that cannot be read raises SchedulerError", SchedulerError)
+
     # --- decode_output and stamp -----------------------------------------------
     check(decode_output("caf\u00e9".encode("utf-16"), "ascii") == "caf\u00e9",
           "a UTF-16 BOM is honoured before the codec")
@@ -1328,6 +1661,136 @@ def _self_test(tmp):
     check(code == 1 and "1 missing" in out and read_json(m9)["thawed"] is None,
           "a thaw with a deleted task enables the rest, exits 1 and is not marked thawed")
 
+    # running tasks
+    put_state(base, busy={"\\Nightly\\Load": 100000})
+    mr1 = manifest_file("mr1")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr1], sched())
+    check(code == 3 and "run now" in err and "\\Nightly\\Load" in err and "--wait" in err
+          and not os.path.exists(mr1),
+          "a plan with a running task and no --wait is refused with exit 3")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr1, "--apply"], sched())
+    check(code == 3 and not os.path.exists(mr1) and enabled_of("\\Nightly\\Load") is True
+          and enabled_of("\\Nightly\\Compress") is True,
+          "a freeze with a running task and no --wait is REFUSED and changes nothing  "
+          "<-- pinned defect")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr1, "--wait", "30"], sched())
+    check(code == 0 and "running  \\Nightly\\Load" in out and "waits up to 30 s" in out
+          and not os.path.exists(mr1) and enabled_of("\\Nightly\\Load") is True,
+          "a plan with --wait lists the running task, exits 0 and changes nothing")
+    put_state(base, busy={"\\Nightly\\Load": 4})
+    mr2 = manifest_file("mr2")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr2, "--apply", "--wait", "5", "--poll",
+                                    "0.05"], sched())
+    check(code == 0 and "froze 2 of 2" in out and "finished \\Nightly\\Load" in out
+          and out.index("disabled \\Nightly\\Load") < out.index("finished \\Nightly\\Load")
+          and enabled_of("\\Nightly\\Load") is False and read_json(mr2)["count"] == 2,
+          "a freeze disables the tasks first, waits for the running one to end and then "
+          "reports the freeze")
+    put_state(base, busy={"\\Nightly\\Load": 100000})
+    mr3 = manifest_file("mr3")
+    began = time.monotonic()
+    code, out, err = cli(NIGHTLY + ["--manifest", mr3, "--apply", "--wait", "0.3", "--poll",
+                                    "0.05"], sched())
+    check(code == 1 and "NOT FROZEN" in out and "froze" not in out
+          and "RUNNING  \\Nightly\\Load" in err and time.monotonic() - began < 10,
+          "a task still running when the wait ends is NOT FROZEN, exits 1 and never prints "
+          "'froze'  <-- pinned defect")
+    check(enabled_of("\\Nightly\\Load") is False and enabled_of("\\Nightly\\Compress") is False
+          and read_json(mr3)["disabled"] == ["\\Nightly\\Compress", "\\Nightly\\Load"],
+          "the tasks stay disabled and recorded, so a thaw restores them")
+    code, out, err = cli(["--status", mr3], sched())
+    check(code == 1 and "RUNNING" in out and "DRIFT" in out,
+          "--status reports a disabled task that still runs as drift  <-- pinned defect")
+    put_state(get_state()["tasks"])
+    code, out, err = cli(["--status", mr3], sched())
+    check(code == 0 and out.startswith("OFF") and "ok: 2 task(s)" in out,
+          "--status is clean once the running task has ended")
+    put_state(base, start_on_change=["\\Nightly\\Load"])
+    mr4 = manifest_file("mr4")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr4, "--apply"], sched())
+    check(code == 1 and "NOT FROZEN" in out and "froze" not in out
+          and "RUNNING  \\Nightly\\Load" in err,
+          "a task that starts between the plan and the disable is caught by the final "
+          "check  <-- pinned defect")
+    for label, extra, word in (
+            ("an unknown status word", {"words": {"\\Nightly\\Load": "Could not start"}},
+             "could not be told"),
+            ("a task missing from the run listing", {"csv_drop": ["\\Nightly\\Load"]},
+             "could not be told"),
+            ("a running task that has one row per trigger",
+             {"busy": {"\\Nightly\\Load": 100000}, "dup": ["\\Nightly\\Load"]}, "run now")):
+        put_state(base, **extra)
+        mr5 = manifest_file("mr5")
+        code, out, err = cli(NIGHTLY + ["--manifest", mr5, "--apply"], sched())
+        check(code == 3 and word in err and not os.path.exists(mr5)
+              and enabled_of("\\Nightly\\Load") is True,
+              "%s refuses the freeze and changes nothing  <-- pinned defect" % label)
+    put_state(base, fail=["\\Nightly\\Load"], busy={"\\Nightly\\Load": 3})
+    mr9 = manifest_file("mr9")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr9, "--apply", "--wait", "2", "--poll",
+                                    "0.05"], sched())
+    check(code == 1 and "FAILED   \\Nightly\\Load" in err and "finished" not in out
+          and "froze 1 of 2" in out and enabled_of("\\Nightly\\Load") is True,
+          "a running task whose disable failed is not reported as finished  "
+          "<-- pinned defect")
+    put_state(base, csv_fail=True)
+    code, out, err = cli(NIGHTLY + ["--manifest", mr5], sched())
+    check(code == 2 and "cannot read the run state" in err and not os.path.exists(mr5),
+          "a run state that cannot be read exits 2 before any change  <-- pinned defect")
+    put_state(base, csv_junk=True)
+    code, out, err = cli(NIGHTLY + ["--manifest", mr5], sched())
+    check(code == 2 and "not usable" in err, "a run-state listing with a bad row exits 2")
+    put_state(base)
+    mr6 = manifest_file("mr6")
+    cli(NIGHTLY + ["--manifest", mr6, "--apply"], sched())
+    put_state(get_state()["tasks"], csv_fail=True)
+    code, out, err = cli(["--status", mr6], sched())
+    check(code == 2 and "cannot read the run state" in err,
+          "--status with an unreadable run state exits 2, not a clean 0")
+    code, out, err = cli(["--thaw", mr6, "--apply"], sched())
+    check(code == 0 and "2 of 2 task(s)" in out,
+          "a thaw needs no run state and works without it")
+    code, out, err = cli(["--status", mr6], sched())
+    check(code == 0 and "thawed at" in out,
+          "--status of a thawed manifest does not read the run state")
+
+    class Scripted(object):
+        """The stand-in, with the run states of the first calls replaced. None delegates,
+        an exception is raised, a dict is returned. After the script it delegates."""
+
+        def __init__(self, script):
+            self.inner = sched()
+            self.script = list(script)
+
+        def list_tasks(self):
+            return self.inner.list_tasks()
+
+        def list_states(self):
+            item = self.script.pop(0) if self.script else None
+            if isinstance(item, Exception):
+                raise item
+            return self.inner.list_states() if item is None else item
+
+        def set_enabled(self, name, on):
+            self.inner.set_enabled(name, on)
+
+    put_state(base)
+    mr7 = manifest_file("mr7")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr7, "--apply"],
+                         Scripted([None, SchedulerError("gone")]))
+    check(code == 2 and "cannot confirm that no task still runs" in err
+          and "froze" not in out and read_json(mr7)["count"] == 2,
+          "a final run check that cannot be read exits 2 and does not report the freeze  "
+          "<-- pinned defect")
+    put_state(base)
+    mr8 = manifest_file("mr8")
+    code, out, err = cli(NIGHTLY + ["--manifest", mr8, "--apply"], Scripted(
+        [None, {"\\nightly\\load": "Could not start", "\\nightly\\compress": "Ready"}]))
+    check(code == 1 and "UNKNOWN  \\Nightly\\Load" in err and "NOT FROZEN" in out
+          and "froze" not in out,
+          "a final run check with an unknown word is NOT FROZEN, not a clean freeze  "
+          "<-- pinned defect")
+
     # manifests that are not usable
     empty = manifest_file("empty")
     with open(empty, "w") as fh:
@@ -1367,6 +1830,9 @@ def _self_test(tmp):
                 raise SchedulerError("gone")
             return self.inner.list_tasks()
 
+        def list_states(self):
+            return self.inner.list_states()
+
         def set_enabled(self, name, on):
             self.inner.set_enabled(name, on)
 
@@ -1388,6 +1854,9 @@ def _self_test(tmp):
 
         def list_tasks(self):
             return self.inner.list_tasks()
+
+        def list_states(self):
+            return self.inner.list_states()
 
         def set_enabled(self, name, on):
             self.inner.set_enabled(name, on)
@@ -1425,12 +1894,22 @@ def _self_test(tmp):
                                     "--schtasks", "unused"])
     check(code == 0 and "disable  \\Nightly\\Load" in out,
           "--from-xml plans a freeze from a saved listing")
+    check("run state not checked" in out,
+          "--from-xml says that it did not check the run state")
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m14"), "--from-xml", export,
                                     "--apply"])
     check(code == 64 and "cannot be combined" in err and not os.path.exists(manifest_file("m14")),
           "--from-xml with --apply is a usage error")
     code, out, err = cli(["--status", m3, "--from-xml", export])
     check(code == 1 and out.startswith("ON"), "--status can read a saved listing")
+    put_state(base)
+    mfx = manifest_file("mfx")
+    cli(NIGHTLY + ["--manifest", mfx, "--apply"], sched())
+    with open(export, "w", encoding="utf-8") as fh:
+        fh.write(fixture_xml(get_state()["tasks"]))
+    code, out, err = cli(["--status", mfx, "--from-xml", export])
+    check(code == 0 and "ok (run state not checked): 2 task(s)" in out,
+          "--status on a saved listing says that it did not check the run state")
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m15"), "--schtasks",
                                     os.path.join(tmp, "absent.exe")])
     check(code == 2 and "cannot run" in err,
@@ -1452,6 +1931,8 @@ def _self_test(tmp):
              "a freeze together with --thaw"),
             (["--thaw", unused, "--status", unused], "separate modes", "--thaw with --status"),
             (["--status", unused, "--apply"], "only reads", "--status with --apply"),
+            (["--thaw", unused, "--wait", "5"], "freeze only", "--wait with --thaw"),
+            (["--status", unused, "--poll", "1"], "freeze only", "--poll with --status"),
             (["--name", "", "--manifest", unused], "empty", "an empty --name"),
             (["--action", "(", "--manifest", unused], "regular expression",
              "a broken --action"),
@@ -1459,12 +1940,19 @@ def _self_test(tmp):
              "a blank --except")):
         code, out, err = cli(argv, sched())
         check(code == 64 and word in err, "usage: %s exits 64" % label)
+    for flag, bad in (("--wait", "nan"), ("--wait", "inf"), ("--wait", "-1"),
+                      ("--wait", "3601"), ("--wait", "soon"), ("--poll", "0"),
+                      ("--poll", "61"), ("--poll", "x")):
+        code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("bad"), flag, bad],
+                             sched())
+        check(code == 64 and "seconds" in err and not os.path.exists(manifest_file("bad")),
+              "%s %s is a usage error" % (flag, bad))
     for flag in ("--ap", "--app", "--appl"):
         code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("abbr"), flag], sched())
         check(code == 64 and not os.path.exists(manifest_file("abbr")),
               "the prefix %s of --apply is REFUSED by the parser  <-- pinned defect" % flag)
     for flag in ("--na", "--act", "--exc", "--man", "--th", "--stat", "--from", "--sch",
-                 "--sel", "--he"):
+                 "--sel", "--he", "--wa", "--po"):
         code, out, err = cli([flag, "x"], sched())
         check(code == 64, "the prefix %s is refused, not expanded" % flag)
     check(build_parser().allow_abbrev is False, "the parser has allow_abbrev False")
