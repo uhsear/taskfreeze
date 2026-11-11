@@ -534,23 +534,23 @@ PASS  the prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 PASS  check() and raises() record failures, and the footer names them and exits 1  <-- pinned defect
 PASS  an all-green harness exits 0 with the 0 failed footer
 --------------------------------------------------------------------
-272 assertions, 0 failed
+274 assertions, 0 failed
 ```
 
-The full run prints all 272 assertions. Each `...` line is where this block is cut.
+The full run prints all 274 assertions. Each `...` line is where this block is cut.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows 11 | 3.13.2 | 272, 0 failed |
-| Windows 11 | 3.12.10 | 272, 0 failed |
-| Windows 11 | 3.9.25 | 272, 0 failed |
-| Ubuntu | 3.12.3 | 272, 0 failed |
+| Windows 11 | 3.13.2 | 274, 0 failed |
+| Windows 11 | 3.12.10 | 274, 0 failed |
+| Windows 11 | 3.9.25 | 274, 0 failed |
+| Ubuntu | 3.12.3 | 274, 0 failed |
 
 The counts are equal because no assertion depends on the host. The default codec assertion checks
 `oem` on Windows and `utf-8` elsewhere in one assertion that passes on both. The run-state cases
 use a stand-in written in Python, so they do not need `schtasks` on Linux either.
 
-Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 1240
+Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 1247
 statements, 274 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
 The `__main__` guard is covered by running the file through `runpy`, once as `__main__` and once
 under another name. `coverage` is not installed on the Linux host, so Linux coverage was not
@@ -575,18 +575,19 @@ the self-test fail:
 | Open the record with mode `w` instead of `x` | 2 |
 | Write the record in place, with no temporary file | 1 |
 | Stamp local time instead of UTC | 1 |
-| Read an unknown status word as idle | 17 |
+| Read an unknown status word as idle | 18 |
 | Keep the first row of a repeated task, not the busiest | 2 |
-| Do not refuse a freeze when a task runs | 9 |
-| Skip the final run check after the disable | 5 |
-| Ignore the run state in `--status` | 5 |
-| Read a task missing from the run listing as idle | 5 |
+| Do not refuse a freeze when a task runs | 10 |
+| Skip the final run check after the disable | 6 |
+| Check only the tasks that read back disabled, not every matched task | 1 |
+| Ignore the run state in `--status`, by editing the ternary in `status_report` | 4 |
+| Read a task missing from the run listing as idle | 6 |
 | Do not cut the last sleep short at the deadline | 1 |
-| Print `froze` on the `NOT FROZEN` line | 4 |
+| Print `froze` on the `NOT FROZEN` line | 5 |
 | Report a task whose disable failed as finished | 1 |
 | Show the scheduler's stdout in an error when stderr is empty | 1 |
 
-All 21 rows were measured against the committed script, which holds 272 assertions.
+All 22 rows were measured against the committed script, which holds 274 assertions.
 
 ## Why the obvious version is wrong
 
@@ -634,8 +635,10 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
 - Run it from a directory you trust, or pass `--schtasks` with a full path. The default is the
   bare name `schtasks`, and Windows searches the current directory when it resolves a bare name.
 - Run it from cmd or PowerShell. A POSIX shell, including Git Bash, halves the backslashes inside
-  double quotes, so `"^[\\]Nightly[\\]"` reaches the tool as `^[\]Nightly[\]`, fails to compile
-  and the tool exits 64. Single quotes keep the backslashes: `'^[\\]Nightly[\\]'`.
+  double quotes, and Git Bash on Windows halves them in single quotes too when it starts a native
+  program. `'^[\\]Nightly[\\]'` reaches the tool as `^[\]Nightly[\]`, fails to compile and the tool
+  exits 64. Write `\x5c` for a backslash instead, as in `'^\x5cNightly\x5c'`: the regex engine reads
+  it as a backslash and the shell has nothing to halve.
 - A task name with characters outside the OEM code page may be listed under a best-fit ASCII name,
   and the freeze then reports that task FAILED.
 - Several tasks in one folder with names outside the OEM code page can make the listing look like
@@ -707,9 +710,9 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   `NOT FROZEN` run still needs a `--thaw` or a repeat of the freeze after the instance ends. A
   repeat onto the same record path is refused, so use `--status` and then `--thaw`.
 - A task whose disable failed, or read back unchanged, is reported `FAILED` or `UNVERIFIED`. It
-  is not checked for a running instance, because it is not in the record, even if it ran at plan
-  time and `--wait` was given. A partial freeze prints `froze N of M` with exit 1 and no
-  `NOT FROZEN` line.
+  is still checked for a running instance, and `--wait` applies to it. If it runs when the wait
+  ends, the run prints `RUNNING ... NOT disabled` and the `NOT FROZEN` line with exit 1. A partial
+  freeze with no running task prints `froze N of M` with exit 1.
 - `UNVERIFIED ... still reads enabled` is also printed when the task no longer exists, because the
   read-back treats a missing task as not disabled. The exit code is non-zero either way.
 - Step 1 of the freeze order lists the refusals. The code also refuses when a matched task that
@@ -754,6 +757,14 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   run it.
 - If another program locks the record when a freeze that disabled nothing tries to remove it, the
   tool exits 70 and leaves the file. Delete it by hand before you retry.
+- A status word the tool does not know, such as `Could not start` or a word in another language,
+  refuses the whole freeze with exit 3, and `--wait` does not help. Give that task to `--except`.
+- A record nested thousands of levels deep ends the run with exit 70 and a traceback instead of a
+  refusal.
+- Task paths are printed and stored as the scheduler lists them, and some tasks have a user SID in
+  the name, so do not paste output or a record into a public place without reading it.
+- A record lists task paths and your patterns. Keep it outside any repository, or add it to
+  `.gitignore`, before you commit, because the `.gitignore` here excludes no `*.json`.
 - `UNVERIFIED` means the task did not read back as disabled. That includes a task that vanished
   during the freeze.
 - Error lines show the scheduler's stderr unchanged. If you point `--schtasks` at a wrapper, make

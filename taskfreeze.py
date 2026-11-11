@@ -668,8 +668,9 @@ def _freeze(args, scheduler, tasks, patterns):
     # Disabled first, so no new instance starts. A disable does not stop one that runs.
     # A task left off is checked too: someone may have disabled it by hand while it ran.
     try:
-        busy, unknown = settle(scheduler.list_states, _by_name(done + plan.leave_off), wait,
-                               poll, _clock, _sleep)
+        busy, unknown = settle(scheduler.list_states,
+                               _by_name(plan.disable + plan.leave_off), wait, poll, _clock,
+                               _sleep)
     except SchedulerError as exc:
         warn("error: cannot confirm that no task still runs: %s. The manifest lists the "
              "disabled tasks. Check --status." % exc)
@@ -678,8 +679,9 @@ def _freeze(args, scheduler, tasks, patterns):
         if (name in done or name in plan.leave_off) and name not in busy and name not in unknown:
             say("finished %s" % name)
     for name in busy:
-        warn("RUNNING  %s: disabled, but an instance still runs and keeps writing. End "
-             "it with schtasks /end, then check --status." % name)
+        warn("RUNNING  %s: %s, but an instance still runs and keeps writing. End "
+             "it with schtasks /end, then check --status."
+             % (name, "disabled" if name in done or name in plan.leave_off else "NOT disabled"))
     for name in unknown:
         warn("UNKNOWN  %s: its run state could not be told." % name)
     if busy or unknown:
@@ -1809,6 +1811,19 @@ def _self_test(tmp):
           and "froze 1 of 2" in out and enabled_of("\\Nightly\\Load") is True,
           "a running task whose disable failed is not reported as finished  "
           "<-- pinned defect")
+    put_state(base, fail=["\\Nightly\\Load"], busy={"\\Nightly\\Load": 100000})
+    mrc = manifest_file("mrc")
+    code, out, err = cli(NIGHTLY + ["--manifest", mrc, "--apply", "--wait", "0.3", "--poll",
+                                    "0.05"], sched())
+    check(code == 1 and "NOT FROZEN" in out and "froze" not in out
+          and "RUNNING  \\Nightly\\Load: NOT disabled" in err
+          and enabled_of("\\Nightly\\Load") is True,
+          "a running task whose disable failed is named NOT FROZEN, not counted as frozen  "
+          "<-- pinned defect")
+    put_state(base)
+    code, out, err = cli(["--name", "^\\x5cNightly\\x5c", "--manifest", mr5], sched())
+    check(code == 0 and "disable  \\Nightly\\Load" in out,
+          "x5c stands for a backslash, so a POSIX shell cannot halve it")
     put_state(base, csv_fail=True)
     code, out, err = cli(NIGHTLY + ["--manifest", mr5], sched())
     check(code == 2 and "cannot read the run state" in err and not os.path.exists(mr5),
