@@ -447,7 +447,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Done, or a plan with nothing wrong. |
-| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs. |
+| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs, and when it reads a saved listing with `--from-xml`, because that holds no run state. |
 | 2 | The scheduler, the run state or a file could not be read or written. |
 | 3 | Refused: nothing to freeze, a record already exists, the record is empty or spent, a task runs and there is no `--wait`, or the run state of a task cannot be told. |
 | 64 | Usage error. |
@@ -495,28 +495,39 @@ report an odd status word, to repeat or drop a row, and to fail the run-state qu
 ```
 taskfreeze self-test: temporary files and a stand-in schtasks, no network
 --------------------------------------------------------------------
+...
 PASS  a disabled task whose triggers all say Enabled true is still disabled  <-- pinned defect
 PASS  an ENABLED task whose trigger says Enabled false is still enabled, so a freeze does not skip it as already off  <-- pinned defect
+...
 PASS  an empty listing is refused, not read as zero tasks  <-- pinned defect
 ...
 PASS  --action reads the command text, never the task path  <-- pinned defect
+...
 PASS  a freeze whose matches are all already off is REFUSED, because its manifest would be empty  <-- pinned defect
 PASS  a freeze onto a manifest that exists is REFUSED  <-- pinned defect
 ...
+PASS  a task with one row per trigger is busy when a later row says Running  <-- pinned defect
+...
 PASS  a freeze whose task runs is REFUSED without --wait
 PASS  a freeze is REFUSED when a task that was already disabled still runs  <-- pinned defect
-PASS  a task with one row per trigger is busy when a later row says Running  <-- pinned defect
+...
+PASS  --status flags a task that was already off before the freeze but still runs  <-- pinned defect
+...
 PASS  settle stops on the deadline, cuts the last sleep short and still reports the task busy  <-- pinned defect
 ...
-PASS  a freeze with a running task and no --wait is REFUSED and changes nothing  <-- pinned defect
-PASS  a task still running when the wait ends is NOT FROZEN, exits 1 and never prints 'froze'  <-- pinned defect
-PASS  --status flags a task that was already off before the freeze but still runs  <-- pinned defect
 PASS  a failing scheduler with only stdout never has that stdout echoed  <-- pinned defect
-PASS  --status reports a disabled task that still runs as drift  <-- pinned defect
-PASS  a task that starts between the plan and the disable is caught by the final check  <-- pinned defect
 ...
 PASS  the task that was off BEFORE the freeze is still off after the thaw  <-- pinned defect
+...
 PASS  a second thaw is REFUSED and does not re-enable a task disabled since  <-- pinned defect
+...
+PASS  a freeze with a running task and no --wait is REFUSED and changes nothing  <-- pinned defect
+...
+PASS  a task still running when the wait ends is NOT FROZEN, exits 1 and never prints 'froze'  <-- pinned defect
+...
+PASS  --status reports a disabled task that still runs as drift  <-- pinned defect
+...
+PASS  a task that starts between the plan and the disable is caught by the final check  <-- pinned defect
 ...
 PASS  the prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 ...
@@ -641,8 +652,8 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   before any change.
 - A manifest that could not be fully written must be deleted by hand before the freeze is
   retried. No task is changed in that case.
-- The trim and thaw steps write `MANIFEST.tmp` beside the record and replace any file with that
-  name. A crash between the write and the rename leaves that file behind.
+- The trim and thaw steps write the record path plus `.tmp` beside the record (`freeze1.json.tmp`
+  for `freeze1.json`) and replace any file with that name. A crash between the write and the rename leaves that file behind.
 - The self-test checks that the exclusive create refuses an existing file. It does not start two
   freezes at the same instant on one path.
 - Thaw every manifest you wrote, newest first. A task frozen by an earlier manifest is listed as
@@ -696,11 +707,30 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   `NOT FROZEN` run still needs a `--thaw` or a repeat of the freeze after the instance ends. A
   repeat onto the same record path is refused, so use `--status` and then `--thaw`.
 - A task whose disable failed, or read back unchanged, is reported `FAILED` or `UNVERIFIED`. It
-  is not checked for a running instance, because it is not in the record.
+  is not checked for a running instance, because it is not in the record, even if it ran at plan
+  time and `--wait` was given. A partial freeze prints `froze N of M` with exit 1 and no
+  `NOT FROZEN` line.
+- `UNVERIFIED ... still reads enabled` is also printed when the task no longer exists, because the
+  read-back treats a missing task as not disabled. The exit code is non-zero either way.
+- Step 1 of the freeze order lists the refusals. The code also refuses when a matched task that
+  was already off has a run-state word the tool does not know, for example
+  `the run state of 1 task(s) could not be told`.
+- A malformed `Settings/Enabled` value or a non-path comment in a `--from-xml` listing is refused
+  with exit 2, and the error quotes that text as it is. Task arguments are never echoed.
+- Three Windows facts rest on observation, not on a Microsoft page: the backslash halving inside
+  quoted command lines, the current-directory search for a bare `schtasks` name, and the OEM code
+  page for `schtasks` output.
+- The Microsoft `TASK_STATE` page says `TASK_STATE_DISABLED` means "no instances of the task are
+  queued or running". This README's central observation is the opposite: a disabled task still
+  read `Running` on Windows 11 on 2026-11-10. The page disagrees with the observation, and the
+  tool rests on what was observed, not on the page.
 - Each poll lists every task on the machine. A machine with a very large scheduler makes each
   poll slow, and `--poll` below the time one listing takes has no effect. This was not measured.
-- `--from-xml` holds no run state. A plan from it says `run state not checked`, and `--status`
-  from it prints `ok (run state not checked)`. It does not claim that nothing runs.
+- `--from-xml` holds no run state. A plan from it says `run state not checked` and exits 0,
+  because a plan is a preview that claims nothing about running tasks. `--status` from it prints
+  `UNVERIFIED (run state not checked)` and exits 1, because a status is a verdict and the tool
+  cannot tell whether a frozen task still runs. A plan from a saved listing cannot be applied:
+  it tells you to run again without `--from-xml`.
 - The self-test writes Python bytecode beside the script. `.gitignore` excludes it.
 - `--wait 0` is the same as leaving `--wait` out: a running task refuses the freeze.
 - The wait ends at the deadline plus at most one slow `schtasks` call, and a call that hangs is
@@ -710,8 +740,9 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   running, with the running task not among the 2.
 - `froze` means the scheduler reports no running instance. A task that starts a detached child
   process and exits reads `Ready` while the child still writes, and the tool cannot see it.
-- Exit 0 from `--status` with `--from-xml` means the enabled flags match. It says nothing about
-  running tasks, because a saved listing holds no run state.
+- `--status` with `--from-xml` exits 1 even when the enabled flags match, for the reason above.
+  Read the printed task lines for the enabled flags, and run `--status` on the machine for the
+  run state.
 - `--from-xml` is read as trusted input. A crafted listing could use a lot of memory.
 - A closed output pipe during `--apply`, for example `| head -1`, ends the run with exit 70 and a
   traceback after some tasks are disabled. The record lists every task attempted, so run
@@ -729,7 +760,7 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   sure it writes no secret to stderr.
 - The record gets the folder's default permissions. Keep it in a folder that only administrators
   can read.
-- `MANIFEST.tmp` is opened without a symbolic-link check. Use a record folder that only trusted
+- The temporary record file is opened without a symbolic-link check. Use a record folder that only trusted
   accounts can write to.
 - The tool writes no CSV and only reads the `schtasks` CSV, so spreadsheet formula injection does
   not apply.

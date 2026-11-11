@@ -23,7 +23,7 @@ already off before the freeze. A manifest that has been thawed cannot be thawed 
 
 Reads the scheduler with `schtasks /query /xml` and changes it with
 `schtasks /change /tn NAME /disable` or `/enable`. Nothing is changed without --apply.
-The one file it writes is the manifest, through MANIFEST.tmp
+The one file it writes is the manifest, through the same path plus .tmp
 when it replaces the manifest. Local machine only.
 
 Disabling a task does not stop an instance that is already running, and a task that
@@ -35,7 +35,8 @@ up is reported as NOT FROZEN (exit 1). A matched task that was already disabled 
 the same: it is checked too. --status reports a disabled task that still runs as drift.
 
 Exit codes: 0 done, 1 not everything was done or verified (a task failed to change,
-did not read back as changed, still runs, or is missing), 2 the scheduler or a file could not be
+did not read back as changed, still runs, is missing, or --status could not read the
+run state), 2 the scheduler or a file could not be
 read or written, 3 refused (nothing to freeze, a manifest already exists, an empty or
 spent manifest, a task runs or its run state cannot be told), 64 usage error, 70 an
 unexpected crash.
@@ -617,7 +618,9 @@ def _freeze(args, scheduler, tasks, patterns):
     say("%d to disable, %d already off and left alone. Manifest: %s"
         % (len(plan.disable), len(plan.leave_off), args.manifest))
     if not args.apply:
-        say("nothing changed. Add --apply to disable them.")
+        say("nothing changed. Add --apply to disable them." if args.from_xml is None else
+            "nothing changed. A saved listing cannot be applied: run again without "
+            "--from-xml, then add --apply.")
         return EXIT_OK
     manifest = build_manifest(plan, args.name, args.action, args.except_pattern, stamp())
     # Written before the first change, so a crash half way never leaves a disabled task
@@ -755,11 +758,13 @@ def _status(scheduler, manifest, tasks):
     for line in lines:
         say(line)
     unchecked = states is None and not thawed
+    # A saved listing holds no run state, so the tool cannot tell whether a frozen task
+    # still runs. That is not a clean verdict: exit 1, like any other unverified result.
     say("%s: %d task(s) in the manifest%s" % (
-        "DRIFT" if drift else "ok" + (" (run state not checked)" if unchecked else ""),
+        "DRIFT" if drift else ("UNVERIFIED (run state not checked)" if unchecked else "ok"),
         len(manifest["disabled"]),
         ", thawed at %s" % manifest["thawed"] if thawed else ""))
-    return EXIT_PARTIAL if drift else EXIT_OK
+    return EXIT_PARTIAL if drift or unchecked else EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -1965,8 +1970,9 @@ def _self_test(tmp):
                                     "--schtasks", "unused"])
     check(code == 0 and "disable  \\Nightly\\Load" in out,
           "--from-xml plans a freeze from a saved listing")
-    check("run state not checked" in out,
-          "--from-xml says that it did not check the run state")
+    check("run state not checked" in out and "run again without --from-xml" in out
+          and "Add --apply to disable" not in out,
+          "--from-xml says that it did not check the run state and does not advise --apply")
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m14"), "--from-xml", export,
                                     "--apply"])
     check(code == 64 and "cannot be combined" in err and not os.path.exists(manifest_file("m14")),
@@ -1979,8 +1985,10 @@ def _self_test(tmp):
     with open(export, "w", encoding="utf-8") as fh:
         fh.write(fixture_xml(get_state()["tasks"]))
     code, out, err = cli(["--status", mfx, "--from-xml", export])
-    check(code == 0 and "ok (run state not checked): 2 task(s)" in out,
-          "--status on a saved listing says that it did not check the run state")
+    check(code == 1 and "UNVERIFIED (run state not checked): 2 task(s)" in out
+          and "ok" not in out,
+          "--status on a saved listing exits 1, not 0, because it cannot tell whether a "
+          "frozen task runs  <-- pinned defect")
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m15"), "--schtasks",
                                     os.path.join(tmp, "absent.exe")])
     check(code == 2 and "cannot run" in err,
