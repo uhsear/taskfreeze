@@ -31,8 +31,8 @@ runs on keeps writing. The freeze reads the run state with `schtasks /query /fo 
 A task that runs when the freeze starts refuses the freeze (exit 3) unless --wait
 SECONDS is given. With --wait the tool disables the tasks first, so no new instance
 starts, then polls until the running ones end. A task that still runs when the time is
-up is reported as NOT FROZEN (exit 1). --status reports a disabled task that still runs
-as drift.
+up is reported as NOT FROZEN (exit 1). A matched task that was already disabled counts
+the same: it is checked too. --status reports a disabled task that still runs as drift.
 
 Exit codes: 0 done, 1 not everything was done or verified (a task failed to change,
 did not read back as changed, still runs, or is missing), 2 the scheduler or a file could not be
@@ -276,14 +276,16 @@ def plan_freeze(tasks, name_re, action_re, except_re, manifest_exists, states=No
                 wait=0):
     """Decide what a freeze would do. refusal is None or the reason it must not run.
     states is the run state of every task, or None when it was not read (a saved
-    listing). running lists the tasks to disable that run now."""
+    listing). running lists the matched tasks that run now, including a task that was
+    already disabled: a disable does not stop an instance, so it is no different."""
     if name_re is None and action_re is None:
         raise ValueError("a freeze needs --name or --action; with neither it would "
                          "select every task")
     matched = select_tasks(tasks, name_re, action_re, except_re)
     disable = _by_name(t.name for t in matched if t.enabled)
     leave_off = _by_name(t.name for t in matched if not t.enabled)
-    running, unknown = run_check(states, disable) if states is not None else ([], [])
+    running, unknown = (run_check(states, _by_name(disable + leave_off))
+                        if states is not None else ([], []))
     refusal = None
     if manifest_exists:
         refusal = ("the manifest file already exists. A second freeze must not "
@@ -410,6 +412,13 @@ def status_report(manifest, tasks, states=None):
     for name in _by_name(manifest["already_off"]):
         task = index.get(name.lower())
         state = "gone" if task is None else ("on" if task.enabled else "off")
+        kind = classify_status(states.get(name.lower())) if states is not None             and not thawed and state == "off" else "idle"
+        if kind != "idle":
+            lines.append("%-8s %s  (off before the freeze, %s)  <-- drift" % (
+                "RUNNING" if kind == "busy" else "UNKNOWN", name,
+                "but an instance runs now" if kind == "busy" else "run state not readable"))
+            drift = True
+            continue
         note = {"off": "off before the freeze, off now",
                 "on": "off before the freeze, on now; not this tool's doing",
                 "gone": "off before the freeze, no longer exists"}[state]
@@ -596,7 +605,7 @@ def _freeze(args, scheduler, tasks, patterns):
     for name in plan.disable:
         say("disable  %s" % name)
     for name in plan.running:
-        say("running  %s  (an instance runs now; disabling does not stop it)" % name)
+        say("running  %s  (an instance runs now; a disabled task keeps running)" % name)
     if states is None:
         say("run state not checked: a saved listing holds none.")
     elif plan.running:
@@ -651,14 +660,16 @@ def _freeze(args, scheduler, tasks, patterns):
                  % exc)
             return EXIT_IO
     # Disabled first, so no new instance starts. A disable does not stop one that runs.
+    # A task left off is checked too: someone may have disabled it by hand while it ran.
     try:
-        busy, unknown = settle(scheduler.list_states, done, wait, poll, _clock, _sleep)
+        busy, unknown = settle(scheduler.list_states, _by_name(done + plan.leave_off), wait,
+                               poll, _clock, _sleep)
     except SchedulerError as exc:
         warn("error: cannot confirm that no task still runs: %s. The manifest lists the "
              "disabled tasks. Check --status." % exc)
         return EXIT_IO
     for name in plan.running:
-        if name in done and name not in busy and name not in unknown:
+        if (name in done or name in plan.leave_off) and name not in busy                 and name not in unknown:
             say("finished %s" % name)
     for name in busy:
         warn("RUNNING  %s: disabled, but an instance still runs and keeps writing. End "
@@ -1302,20 +1313,29 @@ def _self_test(tmp):
           "the listing as unknown")
     check(_some(list("abcdefg")) == "a, b, c, d, e and 2 more" and _some(["a"]) == "a",
           "a long list of names is cut to five")
+    idle_off = {"\\nightly\\reconcile": "Disabled"}
     plan = plan_freeze(tasks, name_re, None, None, False,
-                       {"\\nightly\\load": "Running", "\\nightly\\reconcile": "Running"}, 0)
+                       dict(idle_off, **{"\\nightly\\load": "Running"}), 0)
     check(plan.refusal is not None and "run now" in plan.refusal and "--wait" in plan.refusal
           and plan.running == ["\\Nightly\\Load"],
-          "a freeze whose task runs is REFUSED without --wait, and a disabled task that "
-          "runs is not counted  <-- pinned defect")
-    plan = plan_freeze(tasks, name_re, None, None, False, {"\\nightly\\load": "Running"}, 30)
-    check(plan.refusal is None and plan.running == ["\\Nightly\\Load"],
-          "with a wait the plan goes on and lists the running task")
-    plan = plan_freeze(tasks, name_re, None, None, False, {"\\nightly\\load": "Ready"}, 0)
+          "a freeze whose task runs is REFUSED without --wait")
+    plan = plan_freeze(tasks, name_re, None, None, False,
+                       {"\\nightly\\load": "Ready", "\\nightly\\reconcile": "Running"}, 0)
+    check(plan.refusal is not None and "run now" in plan.refusal
+          and plan.running == ["\\Nightly\\Reconcile"] and plan.leave_off == plan.running,
+          "a freeze is REFUSED when a task that was already disabled still runs  "
+          "<-- pinned defect")
+    plan = plan_freeze(tasks, name_re, None, None, False,
+                       {"\\nightly\\load": "Running", "\\nightly\\reconcile": "Running"}, 30)
+    check(plan.refusal is None
+          and plan.running == ["\\Nightly\\Load", "\\Nightly\\Reconcile"],
+          "with a wait the plan goes on and lists every running task, disabled or not")
+    plan = plan_freeze(tasks, name_re, None, None, False,
+                       dict(idle_off, **{"\\nightly\\load": "Ready"}), 0)
     check(plan.refusal is None and plan.running == [], "an idle task does not stop a freeze")
     for label, given in (("an unknown word", {"\\nightly\\load": "Could not start"}),
                          ("a task missing from the run listing", {})):
-        plan = plan_freeze(tasks, name_re, None, None, False, given, 30)
+        plan = plan_freeze(tasks, name_re, None, None, False, dict(idle_off, **given), 30)
         check(plan.refusal is not None and "could not be told" in plan.refusal,
               "%s REFUSES the freeze even with a wait, because the tool cannot tell  "
               "<-- pinned defect" % label)
@@ -1328,7 +1348,8 @@ def _self_test(tmp):
     check("empty" in plan_freeze(alloff, compile_pattern("--name", "^.X"), None, None, False,
                                  {}, 0).refusal,
           "a freeze with nothing enabled is refused as empty before any run state is judged")
-    lines, drift = status_report(good, now_tasks, {"\\nightly\\load": "Running"})
+    lines, drift = status_report(good, now_tasks,
+                                 dict(idle_off, **{"\\nightly\\load": "Running"}))
     check(drift and lines[0].startswith("RUNNING") and "<-- drift" in lines[0],
           "a live freeze whose task is off but still runs is drift, not a clean freeze  "
           "<-- pinned defect")
@@ -1336,9 +1357,22 @@ def _self_test(tmp):
                         ({"\\nightly\\load": "Disabled"}, "OFF"),
                         ({"\\nightly\\load": "Could not start"}, "UNKNOWN"),
                         ({}, "UNKNOWN")):
-        lines, drift = status_report(good, now_tasks, given)
+        lines, drift = status_report(good, now_tasks, dict(idle_off, **given))
         check(lines[0].startswith(word) and drift == (word != "OFF"),
               "status reads the run state %r of an off task as %s" % (given, word))
+    lines, drift = status_report(good, now_tasks, {"\\nightly\\load": "Disabled",
+                                                   "\\nightly\\reconcile": "Running"})
+    check(drift and lines[1].startswith("RUNNING") and "<-- drift" in lines[1],
+          "--status flags a task that was already off before the freeze but still runs  "
+          "<-- pinned defect")
+    lines, drift = status_report(good, now_tasks, {"\\nightly\\load": "Disabled",
+                                                   "\\nightly\\reconcile": "Could not start"})
+    check(drift and lines[1].startswith("UNKNOWN") and "not readable" in lines[1],
+          "--status flags a task left off whose run state cannot be told")
+    lines, drift = status_report(thawed, now_tasks, {"\\nightly\\load": "Disabled",
+                                                     "\\nightly\\reconcile": "Running"})
+    check(lines[1].startswith("left") and "off now" in lines[1],
+          "a thawed manifest does not run-check a task that was left off")
     lines, drift = status_report(thawed, now_tasks, {"\\nightly\\load": "Running"})
     check(drift and lines[0].startswith("OFF"),
           "a thawed manifest ignores the run state")
@@ -1712,6 +1746,30 @@ def _self_test(tmp):
           and "RUNNING  \\Nightly\\Load" in err,
           "a task that starts between the plan and the disable is caught by the final "
           "check  <-- pinned defect")
+    put_state(base, busy={"\\Nightly\\Reconcile": 100000})
+    mra = manifest_file("mra")
+    code, out, err = cli(NIGHTLY + ["--manifest", mra, "--apply"], sched())
+    check(code == 3 and "run now" in err and "\\Nightly\\Reconcile" in err
+          and not os.path.exists(mra) and enabled_of("\\Nightly\\Load") is True,
+          "a freeze is REFUSED when a task that was already disabled by hand still runs  "
+          "<-- pinned defect")
+    code, out, err = cli(NIGHTLY + ["--manifest", mra, "--apply", "--wait", "0.3", "--poll",
+                                    "0.05"], sched())
+    check(code == 1 and "NOT FROZEN" in out and "froze" not in out
+          and "RUNNING  \\Nightly\\Reconcile" in err and enabled_of("\\Nightly\\Load") is False
+          and read_json(mra)["already_off"] == ["\\Nightly\\Reconcile"],
+          "a task left off that still runs when the wait ends is NOT FROZEN, not a clean "
+          "freeze  <-- pinned defect")
+    code, out, err = cli(["--status", mra], sched())
+    check(code == 1 and "RUNNING  \\Nightly\\Reconcile" in out and "DRIFT" in out,
+          "--status reports a task left off that still runs as drift  <-- pinned defect")
+    put_state(base, busy={"\\Nightly\\Reconcile": 4})
+    mrb = manifest_file("mrb")
+    code, out, err = cli(NIGHTLY + ["--manifest", mrb, "--apply", "--wait", "5", "--poll",
+                                    "0.05"], sched())
+    check(code == 0 and "finished \\Nightly\\Reconcile" in out and "froze 2 of 2" in out,
+          "a task left off that ends inside the wait is reported finished and the freeze "
+          "is clean")
     for label, extra, word in (
             ("an unknown status word", {"words": {"\\Nightly\\Load": "Could not start"}},
              "could not be told"),
