@@ -412,7 +412,9 @@ def status_report(manifest, tasks, states=None):
     for name in _by_name(manifest["already_off"]):
         task = index.get(name.lower())
         state = "gone" if task is None else ("on" if task.enabled else "off")
-        kind = classify_status(states.get(name.lower())) if states is not None             and not thawed and state == "off" else "idle"
+        kind = "idle"
+        if states is not None and not thawed and state == "off":
+            kind = classify_status(states.get(name.lower()))
         if kind != "idle":
             lines.append("%-8s %s  (off before the freeze, %s)  <-- drift" % (
                 "RUNNING" if kind == "busy" else "UNKNOWN", name,
@@ -467,7 +469,8 @@ class Schtasks(object):
             raise SchedulerError("%s did not finish in %s seconds"
                                  % (self.cmd[0], self.timeout))
         if proc.returncode != 0:
-            detail = decode_output(proc.stderr or proc.stdout, self.codec).strip()
+            # stdout is never echoed: on a listing it holds every task argument.
+            detail = decode_output(proc.stderr, self.codec).strip() or "no error text"
             raise SchedulerError("%s %s exited %d: %s" % (
                 self.cmd[0], " ".join(args[:1]), proc.returncode, detail))
         return decode_output(proc.stdout, self.codec)
@@ -948,6 +951,9 @@ with open(state_path) as fh:
     state = json.load(fh)
 if state.get("hang"):
     time.sleep(30)
+if state.get("leak"):
+    sys.stdout.write("TASK Nightly Arguments: --leak-canary-9921\\n")
+    sys.exit(1)
 if argv == ["/query", "/xml"]:
     sys.stdout.buffer.write(taskfreeze.fixture_xml(state["tasks"]).encode("utf-8"))
     sys.exit(0)
@@ -1514,6 +1520,13 @@ def _self_test(tmp):
               "the error names the exit code and the scheduler's own message")
     raises(lambda: Schtasks([os.path.join(tmp, "absent.exe")]).list_tasks(),
            "a missing program raises SchedulerError", SchedulerError)
+    put_state(base, leak=True)
+    try:
+        sched().list_tasks()
+    except SchedulerError as exc:
+        check("leak-canary" not in str(exc) and "exited 1: no error text" in str(exc),
+              "a failing scheduler with only stdout never has that stdout echoed  "
+              "<-- pinned defect")
     put_state(base, hang=True)
     raises(lambda: sched(timeout=0.5).list_tasks(),
            "a call that never returns times out as SchedulerError", SchedulerError)
