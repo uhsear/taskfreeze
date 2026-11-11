@@ -184,7 +184,7 @@ def compile_pattern(flag, text):
         hint = ""
         if text.endswith("\\"):
             # Windows command-line parsing halves the backslashes before a closing quote,
-            # so "^\\Nightly\\" arrives as ^\Nightly\ and ends in a lone backslash.
+            # so "^\\Nightly\\" arrives as ^\\Nightly\ and ends in a lone backslash.
             hint = " A pattern cannot end in a backslash; write [\\\\] for one."
         raise ValueError("%s is not a valid regular expression: %s.%s" % (flag, exc, hint))
 
@@ -672,7 +672,7 @@ def _freeze(args, scheduler, tasks, patterns):
              "disabled tasks. Check --status." % exc)
         return EXIT_IO
     for name in plan.running:
-        if (name in done or name in plan.leave_off) and name not in busy                 and name not in unknown:
+        if (name in done or name in plan.leave_off) and name not in busy and name not in unknown:
             say("finished %s" % name)
     for name in busy:
         warn("RUNNING  %s: disabled, but an instance still runs and keeps writing. End "

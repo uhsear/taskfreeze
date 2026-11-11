@@ -289,50 +289,32 @@ disabled. `idle` does nothing. The driver ended the instance before the thaw.
 ```
 $ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest c.json --apply
 refused: 1 task(s) run now (\taskfreeze-dev\off-running). Disabling a task does not stop a running instance, so it would keep writing during the window. Add --wait SECONDS to wait for them, or end them with schtasks /end.
-
 leave    \taskfreeze-dev\off-running  (already disabled, stays as it is)
-
 matched 1 enabled and 1 already disabled task(s); nothing was changed.
-
 rc=3
 
 $ taskfreeze --name ^[\\]taskfreeze-dev[\\] --manifest c.json --apply --wait 2 --poll 1
 RUNNING  \taskfreeze-dev\off-running: disabled, but an instance still runs and keeps writing. End it with schtasks /end, then check --status.
-
 leave    \taskfreeze-dev\off-running  (already disabled, stays as it is)
-
 disable  \taskfreeze-dev\idle
-
 running  \taskfreeze-dev\off-running  (an instance runs now; a disabled task keeps running)
-
 1 running. After the change the tool waits up to 2 s, polling every 1 s, and reports NOT FROZEN if one still runs.
-
 1 to disable, 1 already off and left alone. Manifest: c.json
-
 disabled \taskfreeze-dev\idle
-
 NOT FROZEN: 1 of 1 task(s) disabled, but 1 still running and 0 could not be read. Manifest: c.json
-
 rc=1
 
 $ taskfreeze --status c.json
 OFF      \taskfreeze-dev\idle
-
 RUNNING  \taskfreeze-dev\off-running  (off before the freeze, but an instance runs now)  <-- drift
-
 DRIFT: 1 task(s) in the manifest
-
 rc=1
 
 $ taskfreeze --thaw c.json --apply
 enable   \taskfreeze-dev\idle
-
 left     \taskfreeze-dev\off-running  (off before the freeze, stays off)
-
 enabled  \taskfreeze-dev\idle
-
 1 of 1 task(s) in the manifest are enabled: 1 enabled now, 0 already on, 0 missing
-
 rc=0
 
 leftover scratch tasks: 0
@@ -571,9 +553,9 @@ the self-test fail:
 
 | Edit | Failing assertions |
 |---|---|
-| Drop the refusal when no matched task is enabled | 2 |
+| Drop the refusal when no matched task is enabled | 3 |
 | Drop the "already thawed" refusal | 3 |
-| Let the thaw also walk `already_off` | 14 |
+| Let the thaw also walk `already_off` | 16 |
 | Set `allow_abbrev=True` | 7 |
 | Drop the empty-`disabled` check in manifest validation | 4 |
 | Read any `Enabled` element in a task, not only `Settings/Enabled` | 1 |
@@ -586,16 +568,14 @@ the self-test fail:
 | Keep the first row of a repeated task, not the busiest | 2 |
 | Do not refuse a freeze when a task runs | 9 |
 | Skip the final run check after the disable | 5 |
-| Ignore the run state in `--status` | 4 |
+| Ignore the run state in `--status` | 5 |
 | Read a task missing from the run listing as idle | 5 |
 | Do not cut the last sleep short at the deadline | 1 |
-| Print `froze` on the `NOT FROZEN` line | 3 |
+| Print `froze` on the `NOT FROZEN` line | 4 |
 | Report a task whose disable failed as finished | 1 |
 | Show the scheduler's stdout in an error when stderr is empty | 1 |
 
-The first eleven rows were measured before the run-state work, with 192 assertions. The last ten
-were measured with 272, except that the rows for an unknown status word, a refused freeze and the
-final run check were measured again at 272 after the already-disabled check was added.
+All 21 rows were measured against the committed script, which holds 272 assertions.
 
 ## Why the obvious version is wrong
 
@@ -738,6 +718,21 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   `--status`, then thaw or repeat the freeze.
 - A record left from a thawed freeze still makes a new freeze onto the same path exit 3 with
   `the manifest file already exists`. Thawing does not free the path, so choose a new path.
+- A task path or the `thawed` text in a record is printed as stored, so a record edited by someone
+  else can send control characters to your terminal. Read a record you did not write before you
+  run it.
+- If another program locks the record when a freeze that disabled nothing tries to remove it, the
+  tool exits 70 and leaves the file. Delete it by hand before you retry.
+- `UNVERIFIED` means the task did not read back as disabled. That includes a task that vanished
+  during the freeze.
+- Error lines show the scheduler's stderr unchanged. If you point `--schtasks` at a wrapper, make
+  sure it writes no secret to stderr.
+- The record gets the folder's default permissions. Keep it in a folder that only administrators
+  can read.
+- `MANIFEST.tmp` is opened without a symbolic-link check. Use a record folder that only trusted
+  accounts can write to.
+- The tool writes no CSV and only reads the `schtasks` CSV, so spreadsheet formula injection does
+  not apply.
 
 ## Contributing
 
