@@ -447,7 +447,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Done, or a plan with nothing wrong. |
-| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs, and when it reads a saved listing with `--from-xml`, because that holds no run state. |
+| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs, A plan or a `--status` that reads a saved listing with `--from-xml` also exits 1, because that holds no run state. |
 | 2 | The scheduler, the run state or a file could not be read or written. |
 | 3 | Refused: nothing to freeze, a record already exists, the record is empty or spent, a task runs and there is no `--wait`, or the run state of a task cannot be told. |
 | 64 | Usage error. |
@@ -477,8 +477,8 @@ a repeated task, a task path with no leading backslash, or an unknown `version`.
    task was enabled before the freeze, so a later thaw can only enable a task that was already
    live. `--status` shows which of them are still enabled.
 
-5. Read the run state of the tasks that stayed in the record, waiting up to `--wait` for the
-   running ones. If one still runs or cannot be read, print `NOT FROZEN` and exit 1. If the run
+5. Read the run state of the tasks the freeze disabled, the ones whose change failed and the ones
+   that were already off, waiting up to `--wait` for the running ones. If one still runs or cannot be read, print `NOT FROZEN` and exit 1. If the run
    state cannot be read at all, exit 2. The record stays in both cases.
 
 The thaw reads back the same way. It does not read the run state. It marks the record thawed only when every listed task is
@@ -534,24 +534,24 @@ PASS  the prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 PASS  check() and raises() record failures, and the footer names them and exits 1  <-- pinned defect
 PASS  an all-green harness exits 0 with the 0 failed footer
 --------------------------------------------------------------------
-274 assertions, 0 failed
+275 assertions, 0 failed
 ```
 
-The full run prints all 274 assertions. Each `...` line is where this block is cut.
+The full run prints all 275 assertions. Each `...` line is where this block is cut.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows 11 | 3.13.2 | 274, 0 failed |
-| Windows 11 | 3.12.10 | 274, 0 failed |
-| Windows 11 | 3.9.25 | 274, 0 failed |
-| Ubuntu | 3.12.3 | 274, 0 failed |
+| Windows 11 | 3.13.2 | 275, 0 failed |
+| Windows 11 | 3.12.10 | 275, 0 failed |
+| Windows 11 | 3.9.25 | 275, 0 failed |
+| Ubuntu | 3.12.3 | 275, 0 failed |
 
 The counts are equal because no assertion depends on the host. The default codec assertion checks
 `oem` on Windows and `utf-8` elsewhere in one assertion that passes on both. The run-state cases
 use a stand-in written in Python, so they do not need `schtasks` on Linux either.
 
-Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 1247
-statements, 274 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
+Branch coverage, measured on Windows with `coverage run --branch taskfreeze.py --self-test`: 1258
+statements, 276 branches, 0 missed, 100 percent, with no `pragma` and no coverage configuration.
 The `__main__` guard is covered by running the file through `runpy`, once as `__main__` and once
 under another name. `coverage` is not installed on the Linux host, so Linux coverage was not
 measured. `pyflakes` is clean on Windows, and `python -W error` compiles the file on both hosts.
@@ -587,7 +587,7 @@ the self-test fail:
 | Report a task whose disable failed as finished | 1 |
 | Show the scheduler's stdout in an error when stderr is empty | 1 |
 
-All 22 rows were measured against the committed script, which holds 274 assertions.
+All 22 rows were measured against the committed script, which holds 275 assertions.
 
 ## Why the obvious version is wrong
 
@@ -675,7 +675,7 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
 - A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
 - `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
   UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
-- The self-test takes about half a minute because it waits for a stand-in scheduler to time out,
+- The self-test takes about half a minute on Windows and about 18 seconds on Linux, because it waits for a stand-in scheduler to time out,
   and it sleeps about a second more in the wait cases.
 - The self-test runs only from a file named `taskfreeze.py`, because the stand-in scheduler
   imports it by that name. A renamed copy exits 70 with `ModuleNotFoundError`.
@@ -729,12 +729,11 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   tool rests on what was observed, not on the page.
 - Each poll lists every task on the machine. A machine with a very large scheduler makes each
   poll slow, and `--poll` below the time one listing takes has no effect. This was not measured.
-- `--from-xml` holds no run state. A plan from it says `run state not checked` and exits 0,
-  because a plan is a preview that claims nothing about running tasks. `--status` from it prints
-  `UNVERIFIED (run state not checked)` and exits 1, because a status is a verdict and the tool
-  cannot tell whether a frozen task still runs. A plan from a saved listing cannot be applied:
+- `--from-xml` holds no run state. A plan from it says `UNVERIFIED (run state not checked)` and exits 1,
+  because the tool cannot tell whether a matched task runs, and exit 0 would claim that none does.
+  `--status` from it says the same and exits 1. A plan from a saved listing cannot be applied:
   it tells you to run again without `--from-xml`.
-- The self-test writes Python bytecode beside the script. `.gitignore` excludes it.
+- The self-test writes nothing beside the script: it runs the stand-in with bytecode off and asserts that no `__pycache__` appears.
 - `--wait 0` is the same as leaving `--wait` out: a running task refuses the freeze.
 - The wait ends at the deadline plus at most one slow `schtasks` call, and a call that hangs is
   cut off after 120 seconds. A hung scheduler can therefore overrun `--wait` by about two minutes.
@@ -743,7 +742,7 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   running, with the running task not among the 2.
 - `froze` means the scheduler reports no running instance. A task that starts a detached child
   process and exits reads `Ready` while the child still writes, and the tool cannot see it.
-- `--status` with `--from-xml` exits 1 even when the enabled flags match, for the reason above.
+- `--status` and a plan with `--from-xml` exit 1 even when the enabled flags match, for the reason above.
   Read the printed task lines for the enabled flags, and run `--status` on the machine for the
   run state.
 - `--from-xml` is read as trusted input. A crafted listing could use a lot of memory.
@@ -767,6 +766,11 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   `.gitignore`, before you commit, because the `.gitignore` here excludes no `*.json`.
 - `UNVERIFIED` means the task did not read back as disabled. That includes a task that vanished
   during the freeze.
+- Exit 1 covers both a task that failed to change and drift or a still-running task. Read the
+  printed lines to tell them apart.
+- A task whose status reads `Could not start` or `Queued` blocks its folder until you give it to
+  `--except`. This is a usability cost, not a wrong verdict.
+- The Windows host table was checked on Python 3.13.2, 3.12.10 and 3.9.25. Any other patch level was not run.
 - Error lines show the scheduler's stderr unchanged. If you point `--schtasks` at a wrapper, make
   sure it writes no secret to stderr.
 - The record gets the folder's default permissions. Keep it in a folder that only administrators

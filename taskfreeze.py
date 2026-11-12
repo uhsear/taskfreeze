@@ -618,9 +618,11 @@ def _freeze(args, scheduler, tasks, patterns):
     say("%d to disable, %d already off and left alone. Manifest: %s"
         % (len(plan.disable), len(plan.leave_off), args.manifest))
     if not args.apply:
-        say("nothing changed. Add --apply to disable them." if args.from_xml is None else
-            "nothing changed. A saved listing cannot be applied: run again without "
-            "--from-xml, then add --apply.")
+        if states is None:
+            say("UNVERIFIED (run state not checked): nothing changed. A saved listing cannot "
+                "be applied: run again without --from-xml, then add --apply.")
+            return EXIT_PARTIAL
+        say("nothing changed. Add --apply to disable them.")
         return EXIT_OK
     manifest = build_manifest(plan, args.name, args.action, args.except_pattern, stamp())
     # Written before the first change, so a crash half way never leaves a disabled task
@@ -1997,10 +1999,11 @@ def _self_test(tmp):
         fh.write(fixture_xml(base))
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m13"), "--from-xml", export,
                                     "--schtasks", "unused"])
-    check(code == 0 and "disable  \\Nightly\\Load" in out,
-          "--from-xml plans a freeze from a saved listing")
+    check(code == 1 and "disable  \\Nightly\\Load" in out,
+          "--from-xml plans a freeze from a saved listing and exits 1, because it cannot "
+          "tell whether a matched task runs  <-- pinned defect")
     check("run state not checked" in out and "run again without --from-xml" in out
-          and "Add --apply to disable" not in out,
+          and "Add --apply to disable" not in out and "UNVERIFIED" in out,
           "--from-xml says that it did not check the run state and does not advise --apply")
     code, out, err = cli(NIGHTLY + ["--manifest", manifest_file("m14"), "--from-xml", export,
                                     "--apply"])
