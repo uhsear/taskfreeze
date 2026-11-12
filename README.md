@@ -161,6 +161,9 @@ does one of three things.
    ends an instance itself. `schtasks /end` does that, and killing a run in the middle of a write
    is a decision for the person at the keyboard.
 
+A `froze` line means the scheduler reports no running instance. It cannot show a detached child
+process that a task started and left behind.
+
 The tool also checks after every freeze, even when nothing ran at the start, because a trigger
 can fire between the plan and the disable. It never reads an unreadable run state as idle. A
 status word it does not know, a task missing from the run listing, and a failed read all stop the
@@ -580,7 +583,7 @@ the self-test fail:
 | Keep the first row of a repeated task, not the busiest | 2 |
 | Do not refuse a freeze when a task runs | 10 |
 | Skip the final run check after the disable | 6 |
-| Check only the tasks that read back disabled, not every matched task | 1 |
+| Check only the tasks that read back disabled, not every matched task | 2 |
 | Ignore the run state in `--status`, by editing the ternary in `status_report` | 4 |
 | Read a task missing from the run listing as idle | 6 |
 | Do not cut the last sleep short at the deadline | 1 |
@@ -676,8 +679,8 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
 - A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
 - `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
   UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
-- The self-test takes about 40 seconds on Windows and about 18 seconds on Linux, because it waits for a stand-in scheduler to time out,
-  and it sleeps about a second more in the wait cases.
+- The self-test takes 39 seconds on a quiet Windows machine and about 17 seconds on Linux, because it waits for a stand-in scheduler to time out,
+  and it sleeps about a second more in the wait cases. A Windows machine with many other Python processes running took 77 seconds.
 - The self-test runs only from a file named `taskfreeze.py`, because the stand-in scheduler
   imports it by that name. A renamed copy exits 70 with `ModuleNotFoundError`.
 - A task name with leading or trailing spaces is addressed without them, so the change fails or
@@ -788,8 +791,21 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   during the freeze.
 - Exit 1 covers both a task that failed to change and drift or a still-running task. Read the
   printed lines to tell them apart.
-- A task whose status reads `Could not start` or `Queued` blocks its folder until you give it to
-  `--except`. This is a usability cost, not a wrong verdict.
+- `--action` and `--from-xml` were run against a real saved listing during review. Their output is
+  not quoted here.
+- A `--from-xml` listing saved as UTF-16 with no byte-order mark is refused with exit 2 and the
+  message `the listing holds no task definitions`. Save it again with a byte-order mark or from cmd.
+- A failed trim or thaw rewrite can leave a stale `.tmp` file beside the record. The tool never
+  reads it, and you can delete it.
+- A freeze that hits a full disk while it writes the record exits 2 with `nothing was disabled`
+  but leaves a truncated record. Delete that file before the next freeze, which refuses with
+  `the manifest file already exists`.
+- A `--from-xml` listing goes to Python's standard XML parser and counts as trusted input. A
+  hand-edited file with a DOCTYPE or an entity bomb is not rejected up front, so read only
+  listings you exported yourself.
+- A task whose status reads `Could not start` blocks its folder until you give it to `--except`.
+  This is a usability cost, not a wrong verdict. A `Queued` task refuses the freeze only while it
+  stays queued, and `--wait` handles it as it handles a running task.
 - The Windows host table was checked on Python 3.13.2, 3.12.10 and 3.9.25. Any other patch level was not run.
 - Error lines show the scheduler's stderr unchanged. If you point `--schtasks` at a wrapper, make
   sure it writes no secret to stderr.
