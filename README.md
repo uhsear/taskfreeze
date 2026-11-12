@@ -367,7 +367,7 @@ Windows already ships the switch. This tool adds the record and the refusals aro
 
 ## How a task is read
 
-The tool runs `schtasks /query /xml`. The command "outputs all task definitions on the system to XML
+The tool runs `schtasks /query /xml`. The page for the command says: "Outputs all task definitions on the system to XML
 format"
 ([schtasks query](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-query)).
 Three details decide whether a task counts as enabled.
@@ -447,7 +447,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Done, or a plan with nothing wrong. |
-| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs, A plan or a `--status` that reads a saved listing with `--from-xml` also exits 1, because that holds no run state. |
+| 1 | Not everything was done or verified: a task failed to change, did not read back as changed, still runs after the wait, or is missing. `--status` also exits 1 on drift, including a disabled task that still runs. A freeze plan or a `--status` that reads a saved listing with `--from-xml` also exits 1, because that holds no run state. A `--thaw` plan from a saved listing reads no run state and exits 0. |
 | 2 | The scheduler, the run state or a file could not be read or written. |
 | 3 | Refused: nothing to freeze, a record already exists, the record is empty or spent, a task runs and there is no `--wait`, or the run state of a task cannot be told. |
 | 64 | Usage error. |
@@ -465,7 +465,8 @@ a repeated task, a task path with no leading backslash, or an unknown `version`.
 
 1. Read the scheduler and the run state, then plan. Refuse if the record exists, nothing matched,
    a matched name lost a character to the console code page, no matched task is enabled, the run
-   state of an enabled matched task cannot be told, or one runs and there is no `--wait`.
+   state of any matched task, enabled or already off, cannot be told, or one runs and there is no
+   `--wait`.
 2. Create the record with mode `x`, which fails if the file exists. It is written before the first
    change, so a crash half way never leaves a disabled task with no record.
 3. Disable each task, then read the scheduler back.
@@ -675,7 +676,7 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
 - A hand-edited record with `true` or `1.0` in place of `1` is accepted for `version` and `count`.
 - `--from-xml` reads a listing that has no byte-order mark with the OEM code page on Windows, so a
   UTF-8 file saved without a BOM shows garbled task names. The plan is read only.
-- The self-test takes about half a minute on Windows and about 18 seconds on Linux, because it waits for a stand-in scheduler to time out,
+- The self-test takes about 40 seconds on Windows and about 18 seconds on Linux, because it waits for a stand-in scheduler to time out,
   and it sleeps about a second more in the wait cases.
 - The self-test runs only from a file named `taskfreeze.py`, because the stand-in scheduler
   imports it by that name. A renamed copy exits 70 with `ModuleNotFoundError`.
@@ -729,10 +730,11 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   tool rests on what was observed, not on the page.
 - Each poll lists every task on the machine. A machine with a very large scheduler makes each
   poll slow, and `--poll` below the time one listing takes has no effect. This was not measured.
-- `--from-xml` holds no run state. A plan from it says `UNVERIFIED (run state not checked)` and exits 1,
+- `--from-xml` holds no run state. A freeze plan from it says `UNVERIFIED (run state not checked)` and exits 1,
   because the tool cannot tell whether a matched task runs, and exit 0 would claim that none does.
   `--status` from it says the same and exits 1. A plan from a saved listing cannot be applied:
-  it tells you to run again without `--from-xml`.
+  it tells you to run again without `--from-xml`. A `--thaw` plan from a saved listing reads no
+  run state, prints no `UNVERIFIED` line and exits 0.
 - The self-test writes nothing beside the script: it runs the stand-in with bytecode off and asserts that no `__pycache__` appears.
 - `--wait 0` is the same as leaving `--wait` out: a running task refuses the freeze.
 - The wait ends at the deadline plus at most one slow `schtasks` call, and a call that hangs is
@@ -742,7 +744,7 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   running, with the running task not among the 2.
 - `froze` means the scheduler reports no running instance. A task that starts a detached child
   process and exits reads `Ready` while the child still writes, and the tool cannot see it.
-- `--status` and a plan with `--from-xml` exit 1 even when the enabled flags match, for the reason above.
+- `--status` and a freeze plan with `--from-xml` exit 1 even when the enabled flags match, for the reason above.
   Read the printed task lines for the enabled flags, and run `--status` on the machine for the
   run state.
 - `--from-xml` is read as trusted input. A crafted listing could use a lot of memory.
@@ -758,6 +760,24 @@ tool reads the run state after the disable and says `NOT FROZEN` while one remai
   tool exits 70 and leaves the file. Delete it by hand before you retry.
 - A status word the tool does not know, such as `Could not start` or a word in another language,
   refuses the whole freeze with exit 3, and `--wait` does not help. Give that task to `--except`.
+- Exit 0 on a dry run means the plan found no refusal. It does not mean that no task runs: a plan
+  with `--wait` and a running task, without `--apply`, exits 0 and prints `nothing changed`. Read
+  the printed run-state lines. The real run prints `NOT FROZEN` if the task keeps running.
+- A `--thaw` of a record from a `NOT FROZEN` freeze enables the tasks again without checking
+  that their instance has ended, because a thaw reads no run state.
+- When every matched task is already disabled, the refusal does not say whether one of them still
+  runs. Run `--status` on the record of the earlier freeze.
+- A status row with a field longer than 131072 characters ends the run with exit 70 and a
+  traceback, not exit 2.
+- If the record cannot be rewritten after a partial freeze, the run exits 2 before the final
+  running-task check, so it does not report a task that still runs.
+- `schtasks` is started with the console as its input. If it asks a question, for example for a
+  password, it reads your keyboard and the call ends at the 120 second limit with exit 2. The tool
+  never sees or stores what you type.
+- A `--from-xml` listing with comments other than the task-path comments that `schtasks` writes
+  is refused, and a hand-edited comment layout can be refused or misread.
+- The exit 70 traceback shows the text of the exception. Read it before you paste it in a public
+  place.
 - A record nested thousands of levels deep ends the run with exit 70 and a traceback instead of a
   refusal.
 - Task paths are printed and stored as the scheduler lists them, and some tasks have a user SID in
